@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "osx-audio-to-text"
+version = "1.0.0"
+description = "Finder Quick Action that transcribes audio/MP4 files to sidecar .txt via xAI Grok STT"
+authors = [
+    {name = "Rob"}
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: MacOS",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Utilities",
+]
+keywords = ["speech-to-text", "stt", "grok", "xai", "macos", "finder", "quick-action", "transcription"]
+dependencies = [
+    "requests>=2.31.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0,<10.0.0",
+    "pytest-cov>=5.0.0,<8.0.0",
+    "flake8>=7.0.0,<8.0.0",
+]
+
+[project.scripts]
+audio-to-text = "audio_to_text:main"
+
+[project.urls]
+Homepage = "https://github.com/the-mace/osx-audio-to-text"
+Issues = "https://github.com/the-mace/osx-audio-to-text/issues"
+Repository = "https://github.com/the-mace/osx-audio-to-text"
+
+[tool.setuptools]
+py-modules = ["audio_to_text"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+]
