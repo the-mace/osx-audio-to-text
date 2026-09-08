@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import requests
 
@@ -138,16 +139,74 @@ def validate_input(path: Path) -> None:
         )
 
 
-def transcribe_file(
+def format_transcript(payload: dict[str, Any], *, use_diarization: bool = True) -> str:
+    """Turn an STT JSON payload into sidecar plaintext.
+
+    When diarization is on and every word has a speaker, consecutive words
+    with the same speaker become one ``Speaker N: …`` paragraph. Otherwise
+    return ``payload["text"]`` unchanged — no invented labels.
+    """
+    fallback = payload.get("text")
+    fallback_str = fallback if isinstance(fallback, str) else ""
+    if not use_diarization:
+        return fallback_str
+
+    words = payload.get("words")
+    if not isinstance(words, list) or not words:
+        return fallback_str
+
+    dict_words = [word for word in words if isinstance(word, dict)]
+    if not dict_words or not all(
+        "speaker" in word and word["speaker"] is not None for word in dict_words
+    ):
+        return fallback_str
+
+    paragraphs: list[str] = []
+    current_speaker: Any = None
+    current_tokens: list[str] = []
+
+    def flush() -> None:
+        if current_speaker is None:
+            return
+        body = " ".join(token for token in current_tokens if token != "")
+        paragraphs.append(f"Speaker {current_speaker}: {body}".rstrip())
+
+    for word in dict_words:
+        token = word.get("text")
+        if not isinstance(token, str):
+            token = ""
+        speaker = word["speaker"]
+        if current_speaker is None:
+            current_speaker = speaker
+            current_tokens = [token]
+            continue
+        if speaker != current_speaker:
+            flush()
+            current_speaker = speaker
+            current_tokens = [token]
+            continue
+        current_tokens.append(token)
+
+    flush()
+    if not paragraphs:
+        return fallback_str
+    return "\n\n".join(paragraphs)
+
+
+def request_transcription(
     path: Path,
     api_key: str,
     language: str = DEFAULT_LANGUAGE,
+    *,
+    diarize: bool = True,
     session: requests.Session | None = None,
-) -> str:
+) -> dict[str, Any]:
     validate_input(path)
     mime = MIME_TYPES[suffix_of(path)]
     post = session.post if session is not None else requests.post
     data = [("format", "true"), ("language", language)]
+    if diarize:
+        data.append(("diarize", "true"))
     last_error: Exception | None = None
 
     for attempt in range(1, 4):
@@ -189,16 +248,53 @@ def transcribe_file(
         except ValueError as exc:
             raise AudioToTextError(f"{path.name}: STT returned non-JSON") from exc
 
-        text = payload.get("text")
-        if text is None:
+        if not isinstance(payload, dict):
+            raise AudioToTextError(f"{path.name}: STT returned non-object JSON")
+        if payload.get("text") is None and not payload.get("words"):
             raise AudioToTextError(f"{path.name}: STT response missing text")
         log(
             f"transcribed file={path.name} duration={payload.get('duration')} "
-            f"language={payload.get('language')} chars={len(text)}"
+            f"language={payload.get('language')} words={len(payload.get('words') or [])}"
         )
-        return text
+        return payload
 
     raise last_error or AudioToTextError(f"{path.name}: STT request failed")
+
+
+def transcribe_file(
+    path: Path,
+    api_key: str,
+    language: str = DEFAULT_LANGUAGE,
+    session: requests.Session | None = None,
+    *,
+    diarize: bool = True,
+) -> str:
+    payload = request_transcription(
+        path, api_key, language=language, diarize=diarize, session=session
+    )
+    return format_transcript(payload, use_diarization=diarize)
+
+
+def json_sidecar_path(source: Path, json_out: str | None) -> Path | None:
+    env_on = os.getenv("AUDIO_TO_TEXT_SAVE_JSON", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if json_out:
+        dest = Path(json_out).expanduser()
+        if dest.is_dir() or json_out.endswith(("/", os.sep)):
+            return dest / f"{source.stem}.stt.json"
+        return dest
+    if env_on:
+        return source.with_suffix(".stt.json")
+    return None
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    body = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    path.write_text(body, encoding="utf-8")
+    log(f"wrote {path}")
 
 
 def _response_detail(response: requests.Response) -> str:
@@ -256,13 +352,22 @@ def process_file(
     language: str,
     dry_run: bool,
     do_notify: bool,
+    *,
+    diarize: bool = True,
+    json_out: str | None = None,
 ) -> Path:
     dest = output_path_for(path)
     if dry_run:
         validate_input(path)
         print(f"Would transcribe {path} -> {dest}")
         return dest
-    text = transcribe_file(path, api_key, language=language)
+    payload = request_transcription(
+        path, api_key, language=language, diarize=diarize
+    )
+    sidecar = json_sidecar_path(path, json_out)
+    if sidecar is not None:
+        write_json(sidecar, payload)
+    text = format_transcript(payload, use_diarization=diarize)
     written = write_transcript(path, text)
     print(written)
     if do_notify:
@@ -290,6 +395,16 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Validate inputs and print output paths without calling the API",
     )
+    parser.add_argument(
+        "--no-diarize",
+        action="store_true",
+        help="Do not request speaker labels; write the merged text field",
+    )
+    parser.add_argument(
+        "--json-out",
+        metavar="PATH",
+        help="Write raw STT JSON to PATH (or AUDIO_TO_TEXT_SAVE_JSON=1 for <stem>.stt.json)",
+    )
     return parser.parse_args(argv)
 
 
@@ -315,6 +430,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 language=args.language,
                 dry_run=args.dry_run,
                 do_notify=args.notify,
+                diarize=not args.no_diarize,
+                json_out=args.json_out,
             )
         except AudioToTextError as exc:
             failures += 1

@@ -56,12 +56,25 @@ killall Finder
 ## Usage
 
 ```bash
-audio-to-text ~/Desktop/clip.mp4
-# writes ~/Desktop/clip.txt
+audio-to-text ~/Desktop/Interview.m4a
+# writes ~/Desktop/Interview.txt with Speaker N: labels when STT returns them
 
 audio-to-text --dry-run ~/Desktop/clip.mp4
 audio-to-text --language en ~/Desktop/clip.m4a
+audio-to-text --no-diarize ~/Desktop/clip.m4a          # merged text field only
+audio-to-text --json-out /tmp/clip.stt.json clip.m4a  # raw STT JSON
 ```
+
+Default output groups consecutive words from Grok STT `diarize=true`:
+
+```
+Speaker 0: …
+
+Speaker 1: …
+```
+
+Labels are the integer `speaker` values from the API. If `words` is missing or has
+no speaker fields, the sidecar is the unlabeled `text` field. No second LLM pass.
 
 Supported extensions: `.mp4`, `.m4a`, `.mp3`, `.wav`, `.aac`, `.flac`,
 `.ogg`, `.opus`, `.mkv`. Max 500 MB per file (Grok STT limit).

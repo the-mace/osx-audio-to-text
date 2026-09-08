@@ -86,6 +86,73 @@ class _FakeResponse:
         return self._payload
 
 
+def test_format_two_speakers_alternating() -> None:
+    payload = {
+        "text": "Hello there. Hi. How are you?",
+        "words": [
+            {"text": "Hello", "speaker": 0, "start": 0.0, "end": 0.3},
+            {"text": "there.", "speaker": 0, "start": 0.3, "end": 0.6},
+            {"text": "Hi.", "speaker": 1, "start": 0.7, "end": 0.9},
+            {"text": "How", "speaker": 0, "start": 1.0, "end": 1.2},
+            {"text": "are", "speaker": 0, "start": 1.2, "end": 1.4},
+            {"text": "you?", "speaker": 0, "start": 1.4, "end": 1.6},
+        ],
+    }
+    assert audio_to_text.format_transcript(payload) == (
+        "Speaker 0: Hello there.\n"
+        "\n"
+        "Speaker 1: Hi.\n"
+        "\n"
+        "Speaker 0: How are you?"
+    )
+
+
+def test_format_one_speaker() -> None:
+    payload = {
+        "text": "Hello there.",
+        "words": [
+            {"text": "Hello", "speaker": 0, "start": 0.0, "end": 0.3},
+            {"text": "there.", "speaker": 0, "start": 0.3, "end": 0.6},
+        ],
+    }
+    assert audio_to_text.format_transcript(payload) == "Speaker 0: Hello there."
+
+
+def test_format_empty_words_falls_back_to_text() -> None:
+    payload = {"text": "Hello world.", "words": []}
+    assert audio_to_text.format_transcript(payload) == "Hello world."
+
+
+def test_format_words_without_speaker_falls_back_to_text() -> None:
+    payload = {
+        "text": "Hello world.",
+        "words": [
+            {"text": "Hello", "start": 0.0, "end": 0.3},
+            {"text": "world.", "start": 0.3, "end": 0.6},
+        ],
+    }
+    assert audio_to_text.format_transcript(payload) == "Hello world."
+
+
+def test_format_missing_words_falls_back_to_text() -> None:
+    payload = {"text": "Hello world."}
+    assert audio_to_text.format_transcript(payload) == "Hello world."
+
+
+def test_format_no_diarization_uses_text_even_with_speakers() -> None:
+    payload = {
+        "text": "Hello there. Hi.",
+        "words": [
+            {"text": "Hello", "speaker": 0},
+            {"text": "there.", "speaker": 0},
+            {"text": "Hi.", "speaker": 1},
+        ],
+    }
+    assert audio_to_text.format_transcript(payload, use_diarization=False) == (
+        "Hello there. Hi."
+    )
+
+
 def test_transcribe_posts_multipart(audio_file: Path) -> None:
     session = MagicMock()
     session.post.return_value = _FakeResponse(
@@ -96,11 +163,54 @@ def test_transcribe_posts_multipart(audio_file: Path) -> None:
     args, kwargs = session.post.call_args
     assert args[0] == audio_to_text.STT_URL
     assert kwargs["headers"]["Authorization"] == "Bearer secret-key"
-    assert kwargs["data"] == [("format", "true"), ("language", "en")]
+    assert kwargs["data"] == [
+        ("format", "true"),
+        ("language", "en"),
+        ("diarize", "true"),
+    ]
     filename, handle, mime = kwargs["files"]["file"]
     assert filename == "clip.mp4"
     assert mime == "video/mp4"
     handle.close()
+
+
+def test_transcribe_no_diarize_omits_flag_and_uses_text(audio_file: Path) -> None:
+    session = MagicMock()
+    session.post.return_value = _FakeResponse(
+        200,
+        {
+            "text": "Hello there. Hi.",
+            "words": [
+                {"text": "Hello", "speaker": 0},
+                {"text": "Hi.", "speaker": 1},
+            ],
+        },
+    )
+    text = audio_to_text.transcribe_file(
+        audio_file, "secret-key", session=session, diarize=False
+    )
+    assert text == "Hello there. Hi."
+    assert session.post.call_args.kwargs["data"] == [
+        ("format", "true"),
+        ("language", "en"),
+    ]
+
+
+def test_transcribe_labels_speakers_from_words(audio_file: Path) -> None:
+    session = MagicMock()
+    session.post.return_value = _FakeResponse(
+        200,
+        {
+            "text": "Hello there. Hi.",
+            "words": [
+                {"text": "Hello", "speaker": 0, "start": 0.0, "end": 0.3},
+                {"text": "there.", "speaker": 0, "start": 0.3, "end": 0.6},
+                {"text": "Hi.", "speaker": 1, "start": 0.7, "end": 0.9},
+            ],
+        },
+    )
+    text = audio_to_text.transcribe_file(audio_file, "key", session=session)
+    assert text == "Speaker 0: Hello there.\n\nSpeaker 1: Hi."
 
 
 def test_transcribe_401(audio_file: Path) -> None:
@@ -141,6 +251,52 @@ def test_main_writes_txt(
     dest = audio_file.with_suffix(".txt")
     assert dest.read_text(encoding="utf-8") == "Hello, this is a speech to text test.\n"
     assert str(dest) in capsys.readouterr().out
+
+
+def test_main_writes_speaker_labels_and_trailing_newline(
+    audio_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "secret-key")
+    fake = _FakeResponse(
+        200,
+        {
+            "text": "Hello there. Hi.",
+            "words": [
+                {"text": "Hello", "speaker": 0},
+                {"text": "there.", "speaker": 0},
+                {"text": "Hi.", "speaker": 1},
+            ],
+        },
+    )
+    with patch("audio_to_text.requests.post", return_value=fake):
+        rc = audio_to_text.main([str(audio_file)])
+    assert rc == 0
+    dest = audio_file.with_suffix(".txt")
+    assert dest.read_text(encoding="utf-8") == (
+        "Speaker 0: Hello there.\n\nSpeaker 1: Hi.\n"
+    )
+
+
+def test_main_json_out_and_env_sidecar(
+    audio_file: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "secret-key")
+    payload = {"text": "Hello world.", "language": "en"}
+    fake = _FakeResponse(200, payload)
+    json_path = tmp_path / "raw.stt.json"
+    with patch("audio_to_text.requests.post", return_value=fake):
+        rc = audio_to_text.main(["--json-out", str(json_path), str(audio_file)])
+    assert rc == 0
+    saved = json.loads(json_path.read_text(encoding="utf-8"))
+    assert saved["text"] == "Hello world."
+
+    monkeypatch.setenv("AUDIO_TO_TEXT_SAVE_JSON", "1")
+    with patch("audio_to_text.requests.post", return_value=fake):
+        rc = audio_to_text.main([str(audio_file)])
+    assert rc == 0
+    sidecar = audio_file.with_suffix(".stt.json")
+    assert sidecar.is_file()
+    assert json.loads(sidecar.read_text(encoding="utf-8"))["text"] == "Hello world."
 
 
 def test_main_missing_key_is_nonzero(

@@ -68,6 +68,9 @@ logs/
 .env.local
 .env.*.local
 
+# Raw STT dumps (may contain personal speech)
+*.stt.json
+
 # Local test media (never commit personal recordings)
 *.wav
 *.mp3
