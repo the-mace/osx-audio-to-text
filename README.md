@@ -35,13 +35,18 @@ cd osx-audio-to-text
 make install
 ```
 
-That installs the `audio-to-text` command and the **Convert to Text** Finder
-Quick Action (a Shortcuts item, same mechanism as Rename Invoice). It only
-appears when the selected file is audio or MP4 — not on PDFs, Word docs, or
-images.
+That installs the `audio-to-text` command and recreates the **Convert to Text**
+Finder Quick Action from `finder/Convert to Text.wflow` in this repo:
 
-If the item is missing from the menu, click an `.m4a` / `.mp4` / `.mp3` and
-try again. Then:
+1. `shortcuts sign --mode anyone` (so the file is valid on any Mac)
+2. Import or **Replace** the Shortcuts item
+3. Register it as a Finder Quick Action (`pbs` / `NSServicesStatus`)
+
+You do not build the shortcut by hand. A fresh clone on another Mac hits the
+same path. The action only appears for audio/MP4, not PDFs, Word docs, or images.
+
+If the item is missing from the menu after install, click an `.m4a` / `.mp4` /
+`.mp3` (not a document), then:
 
 ```bash
 /System/Library/CoreServices/pbs -flush
@@ -66,7 +71,8 @@ Logs: `/tmp/audio_to_text.log`.
 ## Uninstall
 
 ```bash
+# Delete "Convert to Text" in the Shortcuts app
 rm -rf "$HOME/Library/Services/Convert to Text.workflow"
 pip uninstall osx-audio-to-text
-rm -f /usr/local/bin/audio-to-text
+rm -f /usr/local/bin/audio-to-text "$HOME/.local/bin/audio-to-text"
 ```

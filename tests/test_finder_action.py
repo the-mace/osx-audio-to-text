@@ -4,12 +4,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / "finder" / "Convert to Text.workflow"
 INFO = WORKFLOW / "Contents" / "Info.plist"
-WFLOW = WORKFLOW / "Contents" / "document.wflow"
+AUTOMATOR_WFLOW = WORKFLOW / "Contents" / "document.wflow"
+SHORTCUT_WFLOW = ROOT / "finder" / "Convert to Text.wflow"
+INSTALL_PY = ROOT / "scripts" / "install_shortcut.py"
 
 
 def test_workflow_bundle_exists() -> None:
     assert INFO.is_file()
-    assert WFLOW.is_file()
+    assert AUTOMATOR_WFLOW.is_file()
+    assert SHORTCUT_WFLOW.is_file()
+    assert INSTALL_PY.is_file()
 
 
 def test_quick_action_only_audio_and_mp4() -> None:
@@ -28,8 +32,26 @@ def test_quick_action_only_audio_and_mp4() -> None:
     assert "public.data" not in types
 
 
+def test_shortcut_wflow_is_finder_quick_action() -> None:
+    document = plistlib.loads(SHORTCUT_WFLOW.read_bytes())
+    assert document["WFWorkflowName"] == "Convert to Text"
+    assert document["WFWorkflowTypes"] == ["QuickActions"]
+    assert document["WFQuickActionSurfaces"] == ["Finder"]
+    assert document["WFWorkflowInputContentItemClasses"] == ["WFAVAssetContentItem"]
+    assert document["WFWorkflowHasShortcutInputVariables"] is True
+    shell = document["WFWorkflowActions"][1]["WFWorkflowActionParameters"]
+    script = shell["Script"]["Value"]["string"]
+    assert "audio-to-text" in script
+    assert "--notify" in script
+    assert "GROK_API_KEY" not in script
+    assert "xai-" not in script
+    assert INSTALL_PY.read_text(encoding="utf-8").count("shortcuts") >= 1
+    assert "sign" in INSTALL_PY.read_text(encoding="utf-8")
+    assert "--mode" in INSTALL_PY.read_text(encoding="utf-8")
+
+
 def test_workflow_is_finder_quick_action() -> None:
-    document = plistlib.loads(WFLOW.read_bytes())
+    document = plistlib.loads(AUTOMATOR_WFLOW.read_bytes())
     meta = document["workflowMetaData"]
     assert meta["workflowTypeIdentifier"] == "com.apple.Automator.workflowType.userAction"
     assert meta["serviceApplicationBundleID"] == "com.apple.finder"

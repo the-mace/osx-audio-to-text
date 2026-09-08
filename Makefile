@@ -36,7 +36,7 @@ install:  ## Install CLI + Finder Quick Action
 	@echo "$(BLUE)✓ Installed$(RESET)"
 	@echo "Usage: audio-to-text ~/Desktop/clip.mp4"
 
-install-finder:  ## Copy Convert to Text into ~/Library/Services
+install-finder:  ## Sign+import Convert to Text Shortcuts Quick Action
 	@bash "$(CURDIR)/scripts/install-finder-action.sh"
 
 install-dev:  ## Install with pytest/flake8

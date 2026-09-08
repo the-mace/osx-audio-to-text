@@ -7,7 +7,9 @@ Finder Quick Action, Grok STT only.
   second provider.
 - API keys live in the environment or `~/.env` as `GROK_API_KEY` or
   `XAI_API_KEY`. Never commit secrets.
-- Finder action name is **Convert to Text**. It must stay limited to audio
-  UTIs plus `public.mpeg-4` (MP4). Do not show it for PDFs, images, or text.
-- `make install` installs the CLI and copies the workflow into
-  `~/Library/Services/`.
+- Finder action name is **Convert to Text**. Input is Shortcuts
+  `WFAVAssetContentItem` (audio + MP4). Do not show it for PDFs, images, or text.
+- The reproducible artifact is `finder/Convert to Text.wflow`. `make install`
+  signs it (`shortcuts sign --mode anyone`), imports/replaces the Shortcuts
+  item, and registers it in `pbs`. Do not rely on a pre-existing local
+  Shortcuts library entry.
