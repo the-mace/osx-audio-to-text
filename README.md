@@ -28,6 +28,14 @@ transcribed remotely. `meeting-summary` also sends the transcript to
 `POST https://api.x.ai/v1/chat/completions`. Nothing is stored by this tool
 except the local output files.
 
+This project does not record audio. You may still need consent or other
+permission to make or keep the recording in the first place. You are
+also responsible for having the right to transcribe and summarize the
+file you pass it, including sending that audio and transcript to a
+third-party API. That can conflict with all-party consent laws, NDAs,
+workplace policy, privilege, or data-protection rules. This is not
+legal advice. xAI's terms apply to the API calls.
+
 ## Requirements
 
 - macOS
