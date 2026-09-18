@@ -123,7 +123,9 @@ does not run a second LLM pass; `meeting-summary` does (Grok chat).
 `--no-format` is CLI-only; the Finder action still sends `format=true`.
 
 Supported extensions: `.mp4`, `.m4a`, `.mp3`, `.wav`, `.aac`, `.flac`,
-`.ogg`, `.opus`, `.mkv`. Max 500 MB per file (Grok STT limit).
+`.ogg`, `.opus`, `.mkv`, `.qta`. Max 500 MB per file (Grok STT limit).
+`.qta` is remuxed to `.m4a` first (`ffmpeg -map 0:a:0 -c:a copy`), then
+the usual 16 kHz mono prepare. ffmpeg is required for `.qta`.
 
 Logs: `/tmp/audio_to_text.log`.
 

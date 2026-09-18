@@ -43,6 +43,7 @@ SUPPORTED_EXTENSIONS = {
     ".mp4",
     ".m4a",
     ".mkv",
+    ".qta",
 }
 
 MIME_TYPES = {
@@ -173,6 +174,54 @@ def audio_channel_count(path: Path) -> int | None:
     if count < 1:
         return None
     return count
+
+
+def unwrap_qta(path: Path) -> Path:
+    """Remux the first audio stream of a .qta container to a temp .m4a."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise AudioToTextError(
+            "ffmpeg is required to transcribe .qta files. "
+            "Install ffmpeg and retry."
+        )
+    fd, raw = tempfile.mkstemp(prefix="audio_to_text_", suffix=".m4a")
+    os.close(fd)
+    dest = Path(raw)
+    try:
+        completed = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(path),
+                "-map",
+                "0:a:0",
+                "-c:a",
+                "copy",
+                str(dest),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_for(path),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        dest.unlink(missing_ok=True)
+        raise AudioToTextError(
+            f"{path.name}: could not remux .qta to .m4a: {exc}"
+        ) from exc
+    if completed.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+        err = (completed.stderr or "").strip().replace("\n", " ")[:200]
+        dest.unlink(missing_ok=True)
+        detail = f": {err}" if err else ""
+        raise AudioToTextError(
+            f"{path.name}: could not remux .qta to .m4a{detail}"
+        )
+    log(f"remuxed qta to m4a file={path.name} bytes={dest.stat().st_size}")
+    return dest
 
 
 def prepare_stt_wav(path: Path) -> Path | None:
@@ -472,7 +521,11 @@ def format_transcript(
         if len(nonempty) >= 2 and len(set(nonempty)) == 1:
             first = channel_dicts[0]
             payload = {
-                "text": first.get("text") if isinstance(first.get("text"), str) else payload.get("text"),
+                "text": (
+                    first.get("text")
+                    if isinstance(first.get("text"), str)
+                    else payload.get("text")
+                ),
                 "words": (
                     first.get("words")
                     if isinstance(first.get("words"), list)
@@ -539,28 +592,35 @@ def request_transcription(
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
     validate_input(path)
+    unwrapped: Path | None = None
     prepared: Path | None = None
     send_path = path
-    if prepare and not multichannel:
-        prepared = prepare_stt_wav(path)
-        if prepared is not None:
-            send_path = prepared
-    mime = MIME_TYPES.get(suffix_of(send_path), "audio/wav")
-    post = session.post if session is not None else requests.post
-    chosen_model = model or stt_model()
-    data: list[tuple[str, str]] = [("model", chosen_model)]
-    if format_text:
-        data.append(("format", "true"))
-    data.append(("language", language))
-    data.append(("filler_words", "true"))
-    if diarize:
-        data.append(("diarize", "true"))
-    if multichannel:
-        data.append(("multichannel", "true"))
-    last_error: Exception | None = None
-    upload_name = path.name if send_path == path else f"{path.stem}.wav"
-
     try:
+        if suffix_of(path) == ".qta":
+            unwrapped = unwrap_qta(path)
+            send_path = unwrapped
+        if prepare and not multichannel:
+            prepared = prepare_stt_wav(send_path)
+            if prepared is not None:
+                send_path = prepared
+        mime = MIME_TYPES.get(suffix_of(send_path), "audio/wav")
+        post = session.post if session is not None else requests.post
+        chosen_model = model or stt_model()
+        data: list[tuple[str, str]] = [("model", chosen_model)]
+        if format_text:
+            data.append(("format", "true"))
+        data.append(("language", language))
+        data.append(("filler_words", "true"))
+        if diarize:
+            data.append(("diarize", "true"))
+        if multichannel:
+            data.append(("multichannel", "true"))
+        last_error: Exception | None = None
+        if send_path == path:
+            upload_name = path.name
+        else:
+            upload_name = f"{path.stem}{send_path.suffix}"
+
         for attempt in range(1, 4):
             try:
                 with send_path.open("rb") as handle:
@@ -624,6 +684,8 @@ def request_transcription(
     finally:
         if prepared is not None:
             prepared.unlink(missing_ok=True)
+        if unwrapped is not None:
+            unwrapped.unlink(missing_ok=True)
 
 
 def transcribe_file(

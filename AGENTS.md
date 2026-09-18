@@ -14,6 +14,10 @@ Finder Quick Action, xAI only.
 - Always pin the latest available STT model. Default is
   `grok-voice-transcribe-2.0`. Never omit `model` on `/v1/stt` — xAI
   defaults to `grok-voice-transcribe-1.0`. Override with `GROK_STT_MODEL`.
+- `.qta` inputs are remuxed first with
+  `ffmpeg -i file.qta -map 0:a:0 -c:a copy file.m4a`, then the usual
+  16 kHz mono prepare. ffmpeg is required for `.qta`. Do not send the
+  `.qta` file to STT.
 - Default summary model is `grok-4.20-0309-non-reasoning` (same family as
   `osx-file-renamer`). Override with `--model` or `MEETING_SUMMARY_MODEL`.
 - `audio-to-text` writes a sidecar `.txt` next to the recording.

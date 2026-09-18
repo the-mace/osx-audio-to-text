@@ -17,6 +17,8 @@ def test_supported_extensions() -> None:
     assert audio_to_text.is_supported(Path("talk.MP4"))
     assert audio_to_text.is_supported(Path("talk.m4a"))
     assert audio_to_text.is_supported(Path("talk.mp3"))
+    assert audio_to_text.is_supported(Path("talk.qta"))
+    assert audio_to_text.is_supported(Path("talk.QTA"))
     assert not audio_to_text.is_supported(Path("talk.pdf"))
     assert not audio_to_text.is_supported(Path("talk.txt"))
     assert not audio_to_text.is_supported(Path("talk.jpg"))
@@ -668,6 +670,120 @@ def test_prepare_stt_wav_runs_ffmpeg(
     argv_dest = dest_holder["dest"]
     assert argv_dest.endswith(".wav")
     prepared.unlink()
+
+
+def test_unwrap_qta_runs_ffmpeg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    qta = tmp_path / "talk.qta"
+    qta.write_bytes(b"fake-qta")
+    dest_holder: dict[str, list[str]] = {}
+
+    def fake_run(argv, **kwargs):
+        dest_holder["argv"] = list(argv)
+        Path(argv[-1]).write_bytes(b"fake-m4a")
+        completed = MagicMock()
+        completed.returncode = 0
+        completed.stderr = ""
+        return completed
+
+    monkeypatch.setattr(audio_to_text.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(audio_to_text.subprocess, "run", fake_run)
+    unwrapped = audio_to_text.unwrap_qta(qta)
+    assert unwrapped is not None
+    assert unwrapped.read_bytes() == b"fake-m4a"
+    argv = dest_holder["argv"]
+    assert argv[argv.index("-i") + 1] == str(qta)
+    assert argv[argv.index("-map") + 1] == "0:a:0"
+    assert argv[argv.index("-c:a") + 1] == "copy"
+    assert argv[-1].endswith(".m4a")
+    unwrapped.unlink()
+
+
+def test_unwrap_qta_requires_ffmpeg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    qta = tmp_path / "talk.qta"
+    qta.write_bytes(b"fake-qta")
+    monkeypatch.setattr(audio_to_text.shutil, "which", lambda _: None)
+    with pytest.raises(audio_to_text.AudioToTextError, match="ffmpeg is required"):
+        audio_to_text.unwrap_qta(qta)
+
+
+def test_unwrap_qta_failure_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    qta = tmp_path / "talk.qta"
+    qta.write_bytes(b"fake-qta")
+    dest_holder: dict[str, str] = {}
+
+    def fake_run(argv, **kwargs):
+        dest_holder["dest"] = argv[-1]
+        completed = MagicMock()
+        completed.returncode = 1
+        completed.stderr = "no audio stream"
+        return completed
+
+    monkeypatch.setattr(audio_to_text.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(audio_to_text.subprocess, "run", fake_run)
+    with pytest.raises(audio_to_text.AudioToTextError, match="could not remux"):
+        audio_to_text.unwrap_qta(qta)
+    assert not Path(dest_holder["dest"]).exists()
+
+
+@pytest.mark.enable_prepare
+def test_qta_remuxes_to_m4a_then_prepares(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    qta = tmp_path / "talk.qta"
+    qta.write_bytes(b"fake-qta")
+    m4a = tmp_path / "talk.m4a"
+    m4a.write_bytes(b"fake-m4a")
+    wav = tmp_path / "talk.wav"
+    wav.write_bytes(b"RIFF")
+
+    def fake_unwrap(path: Path) -> Path:
+        assert path == qta
+        return m4a
+
+    def fake_prepare(path: Path) -> Path:
+        assert path == m4a
+        return wav
+
+    monkeypatch.setattr(audio_to_text, "unwrap_qta", fake_unwrap)
+    monkeypatch.setattr(audio_to_text, "prepare_stt_wav", fake_prepare)
+    session = MagicMock()
+    session.post.return_value = _FakeResponse(200, {"text": "ok"})
+    audio_to_text.transcribe_file(qta, "key", session=session)
+    filename, handle, mime = session.post.call_args.kwargs["files"]["file"]
+    assert filename == "talk.wav"
+    assert mime == "audio/wav"
+    handle.close()
+    assert not m4a.exists()
+    assert not wav.exists()
+
+
+def test_qta_no_prepare_still_sends_m4a(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    qta = tmp_path / "talk.qta"
+    qta.write_bytes(b"fake-qta")
+    m4a = tmp_path / "talk.m4a"
+    m4a.write_bytes(b"fake-m4a")
+
+    def fake_unwrap(path: Path) -> Path:
+        assert path == qta
+        return m4a
+
+    monkeypatch.setattr(audio_to_text, "unwrap_qta", fake_unwrap)
+    session = MagicMock()
+    session.post.return_value = _FakeResponse(200, {"text": "ok"})
+    audio_to_text.request_transcription(
+        qta, "key", prepare=False, session=session
+    )
+    filename, handle, mime = session.post.call_args.kwargs["files"]["file"]
+    assert filename == "talk.m4a"
+    assert mime == "audio/mp4"
+    handle.close()
+    assert not m4a.exists()
 
 
 def test_logs_duration_and_lengths(

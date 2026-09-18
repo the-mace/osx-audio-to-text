@@ -91,6 +91,17 @@ def test_main_dry_run(audio_file: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert not dest_dir.exists()
 
 
+def test_dry_run_accepts_qta(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    source = tmp_path / "standup.qta"
+    source.write_bytes(b"fake-qta")
+    rc = meeting_summary.main(["--dry-run", str(source)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    dest_dir = source.parent / source.stem
+    assert str(dest_dir / "summary.md") in out
+    assert str(dest_dir / "transcript.txt") in out
+
+
 def test_main_writes_folder(
     audio_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
