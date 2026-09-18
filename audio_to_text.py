@@ -6,9 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -19,7 +22,16 @@ STT_URL = "https://api.x.ai/v1/stt"
 ENV_FILE_PATH = Path.home() / ".env"
 LOG_PATH = Path("/tmp/audio_to_text.log")
 MAX_FILE_BYTES = 500 * 1024 * 1024
+STT_SAMPLE_RATE = 16000
+DEFAULT_STT_MODEL = "grok-voice-transcribe-2.0"
 DEFAULT_LANGUAGE = "en"
+DEFAULT_MIN_TURN_SECONDS = 1.2
+DEFAULT_MIN_TURN_WORDS = 3
+BARGE_IN_GAP_SECONDS = 0.35
+ISOLATION_GAP_SECONDS = 0.8
+INCOMPLETE_WORD_RATIO = 0.85
+WORDS_INCOMPLETE_WARNING = "diarization words shorter than text; wrote complete text."
+FULL_TEXT_HEADING = "Full STT text (no speakers)"
 
 SUPPORTED_EXTENSIONS = {
     ".wav",
@@ -86,6 +98,11 @@ def load_env_file(env_file: Path | None = None) -> None:
         os.environ["XAI_API_KEY"] = os.getenv("GROK_API_KEY", "")
 
 
+def stt_model() -> str:
+    """Latest Grok Voice Transcribe model. Override with GROK_STT_MODEL."""
+    return os.getenv("GROK_STT_MODEL") or DEFAULT_STT_MODEL
+
+
 def get_api_key() -> str:
     load_env_file()
     key = os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY") or ""
@@ -120,6 +137,89 @@ def timeout_for(path: Path) -> int:
     return 300
 
 
+def audio_channel_count(path: Path) -> int | None:
+    """Return the first audio stream's channel count, or None if unknown."""
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=channels",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    lines = (completed.stdout or "").strip().splitlines()
+    if not lines:
+        return None
+    raw = lines[0].strip().split(",")[0].strip()
+    try:
+        count = int(raw)
+    except ValueError:
+        return None
+    if count < 1:
+        return None
+    return count
+
+
+def prepare_stt_wav(path: Path) -> Path | None:
+    """Downmix to 16 kHz mono WAV — the same input whisper.cpp wants."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        log(f"ffmpeg not found; sending original {path.name}")
+        return None
+    fd, raw = tempfile.mkstemp(prefix="audio_to_text_", suffix=".wav")
+    os.close(fd)
+    dest = Path(raw)
+    try:
+        completed = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(path),
+                "-ac",
+                "1",
+                "-ar",
+                str(STT_SAMPLE_RATE),
+                "-c:a",
+                "pcm_s16le",
+                str(dest),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_for(path),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        dest.unlink(missing_ok=True)
+        log(f"prepare failed file={path.name} error={exc}")
+        return None
+    if completed.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+        err = (completed.stderr or "").strip().replace("\n", " ")[:200]
+        dest.unlink(missing_ok=True)
+        log(f"prepare ffmpeg failed file={path.name} {err}")
+        return None
+    log(f"prepared 16kHz mono wav file={path.name} bytes={dest.stat().st_size}")
+    return dest
+
+
 def validate_input(path: Path) -> None:
     if not path.exists():
         raise AudioToTextError(f"File not found: {path}")
@@ -139,13 +239,257 @@ def validate_input(path: Path) -> None:
         )
 
 
-def format_transcript(payload: dict[str, Any], *, use_diarization: bool = True) -> str:
+@dataclass
+class _Turn:
+    speaker: Any
+    tokens: list[str]
+    start: float | None = None
+    end: float | None = None
+
+    @property
+    def word_count(self) -> int:
+        return sum(1 for token in self.tokens if token != "")
+
+    @property
+    def duration(self) -> float | None:
+        if self.start is None or self.end is None:
+            return None
+        return max(0.0, self.end - self.start)
+
+    def body(self) -> str:
+        return " ".join(token for token in self.tokens if token != "")
+
+
+def _as_time(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def join_word_texts(words: Sequence[Any]) -> str:
+    tokens: list[str] = []
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+        token = word.get("text")
+        if isinstance(token, str) and token != "":
+            tokens.append(token)
+    return " ".join(tokens)
+
+
+def whitespace_normalized_len(text: str) -> int:
+    return len(" ".join(text.split()))
+
+
+def words_incomplete(reconstructed: str, text: str) -> bool:
+    text_len = whitespace_normalized_len(text)
+    if text_len == 0:
+        return False
+    return whitespace_normalized_len(reconstructed) < INCOMPLETE_WORD_RATIO * text_len
+
+
+def _gap_seconds(left: _Turn | None, right: _Turn | None) -> float | None:
+    if left is None or right is None:
+        return None
+    if left.end is None or right.start is None:
+        return None
+    return max(0.0, right.start - left.end)
+
+
+def _is_isolated(turns: Sequence[_Turn], index: int) -> bool:
+    turn = turns[index]
+    prev = turns[index - 1] if index > 0 else None
+    nxt = turns[index + 1] if index + 1 < len(turns) else None
+    if prev is None:
+        isolated_before = True
+    else:
+        gap = _gap_seconds(prev, turn)
+        isolated_before = gap is not None and gap >= ISOLATION_GAP_SECONDS
+    if nxt is None:
+        isolated_after = True
+    else:
+        gap = _gap_seconds(turn, nxt)
+        isolated_after = gap is not None and gap >= ISOLATION_GAP_SECONDS
+    return isolated_before and isolated_after
+
+
+def _is_flicker(
+    turns: Sequence[_Turn],
+    index: int,
+    *,
+    min_turn_seconds: float,
+    min_turn_words: int,
+) -> bool:
+    turn = turns[index]
+    duration = turn.duration
+    if duration is None or duration >= min_turn_seconds:
+        return False
+    if turn.word_count > min_turn_words:
+        return False
+    if _is_isolated(turns, index):
+        return False
+
+    prev = turns[index - 1] if index > 0 else None
+    nxt = turns[index + 1] if index + 1 < len(turns) else None
+    sandwiched = (
+        prev is not None
+        and nxt is not None
+        and prev.speaker != turn.speaker
+        and nxt.speaker != turn.speaker
+    )
+    gap_before = _gap_seconds(prev, turn)
+    barge_in = (
+        prev is not None
+        and turn.word_count <= 2
+        and gap_before is not None
+        and gap_before < BARGE_IN_GAP_SECONDS
+    )
+    return sandwiched or barge_in
+
+
+def _absorb(target: _Turn, source: _Turn, *, prepend: bool = False) -> None:
+    if prepend:
+        target.tokens = source.tokens + target.tokens
+        if source.start is not None:
+            target.start = (
+                source.start if target.start is None else min(target.start, source.start)
+            )
+        if source.end is not None and target.end is None:
+            target.end = source.end
+    else:
+        target.tokens = target.tokens + source.tokens
+        if source.end is not None:
+            target.end = source.end if target.end is None else max(target.end, source.end)
+        if source.start is not None and target.start is None:
+            target.start = source.start
+
+
+def _coalesce_adjacent(turns: list[_Turn]) -> None:
+    i = 0
+    while i < len(turns) - 1:
+        if turns[i].speaker == turns[i + 1].speaker:
+            _absorb(turns[i], turns[i + 1])
+            del turns[i + 1]
+            continue
+        i += 1
+
+
+def merge_flicker_turns(
+    turns: list[_Turn],
+    *,
+    min_turn_seconds: float = DEFAULT_MIN_TURN_SECONDS,
+    min_turn_words: int = DEFAULT_MIN_TURN_WORDS,
+) -> list[_Turn]:
+    """Collapse implausible micro-turns into the adjacent speaker."""
+    if len(turns) < 2:
+        return turns
+    merged = [
+        _Turn(speaker=turn.speaker, tokens=list(turn.tokens), start=turn.start, end=turn.end)
+        for turn in turns
+    ]
+    i = 0
+    while i < len(merged):
+        if _is_flicker(
+            merged,
+            i,
+            min_turn_seconds=min_turn_seconds,
+            min_turn_words=min_turn_words,
+        ):
+            if i == 0:
+                _absorb(merged[1], merged[0], prepend=True)
+                del merged[0]
+            else:
+                _absorb(merged[i - 1], merged[i])
+                del merged[i]
+            _coalesce_adjacent(merged)
+            i = 0
+            continue
+        i += 1
+    return merged
+
+
+def _group_speaker_turns(dict_words: list[dict[str, Any]]) -> list[_Turn]:
+    turns: list[_Turn] = []
+    for word in dict_words:
+        token = word.get("text")
+        if not isinstance(token, str):
+            token = ""
+        speaker = word["speaker"]
+        start = _as_time(word.get("start"))
+        end = _as_time(word.get("end"))
+        if turns and turns[-1].speaker == speaker:
+            turns[-1].tokens.append(token)
+            if turns[-1].start is None:
+                turns[-1].start = start
+            if end is not None:
+                turns[-1].end = end
+            continue
+        turns.append(_Turn(speaker=speaker, tokens=[token], start=start, end=end))
+    return turns
+
+
+def _labeled_from_turns(turns: Sequence[_Turn]) -> str:
+    paragraphs = [f"Speaker {turn.speaker}: {turn.body()}".rstrip() for turn in turns]
+    return "\n\n".join(paragraphs)
+
+
+def _channel_dicts(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    channels = payload.get("channels")
+    if not isinstance(channels, list):
+        return []
+    return [channel for channel in channels if isinstance(channel, dict)]
+
+
+def format_transcript(
+    payload: dict[str, Any],
+    *,
+    use_diarization: bool = True,
+    merge_turns: bool = True,
+    min_turn_seconds: float = DEFAULT_MIN_TURN_SECONDS,
+    min_turn_words: int = DEFAULT_MIN_TURN_WORDS,
+    prefer_complete: bool = True,
+) -> str:
     """Turn an STT JSON payload into sidecar plaintext.
 
     When diarization is on and every word has a speaker, consecutive words
-    with the same speaker become one ``Speaker N: …`` paragraph. Otherwise
-    return ``payload["text"]`` unchanged — no invented labels.
+    with the same speaker become one ``Speaker N: …`` paragraph. Short
+    flicker turns are merged into the adjacent speaker unless disabled.
+    Otherwise return ``payload["text"]`` unchanged — no invented labels.
+
+    ``multichannel=true`` returns a ``channels`` array. Identical channel
+    texts (typical stereo Voice Memo) collapse to one transcript. Distinct
+    channels become ``Channel N:`` paragraphs.
     """
+    channel_dicts = _channel_dicts(payload)
+    if channel_dicts:
+        normalized = []
+        for channel in channel_dicts:
+            text = channel.get("text")
+            normalized.append(" ".join(text.split()) if isinstance(text, str) else "")
+        nonempty = [text for text in normalized if text]
+        if len(nonempty) >= 2 and len(set(nonempty)) == 1:
+            first = channel_dicts[0]
+            payload = {
+                "text": first.get("text") if isinstance(first.get("text"), str) else payload.get("text"),
+                "words": (
+                    first.get("words")
+                    if isinstance(first.get("words"), list)
+                    else payload.get("words")
+                ),
+            }
+        elif len(nonempty) >= 2:
+            paragraphs = []
+            for channel in channel_dicts:
+                text = channel.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                index = channel.get("index", len(paragraphs))
+                paragraphs.append(f"Channel {index}: {text}".rstrip())
+            if paragraphs:
+                return "\n\n".join(paragraphs)
+
     fallback = payload.get("text")
     fallback_str = fallback if isinstance(fallback, str) else ""
     if not use_diarization:
@@ -156,41 +500,30 @@ def format_transcript(payload: dict[str, Any], *, use_diarization: bool = True) 
         return fallback_str
 
     dict_words = [word for word in words if isinstance(word, dict)]
+    reconstructed = join_word_texts(dict_words)
+    incomplete = words_incomplete(reconstructed, fallback_str)
+
     if not dict_words or not all(
         "speaker" in word and word["speaker"] is not None for word in dict_words
     ):
         return fallback_str
 
-    paragraphs: list[str] = []
-    current_speaker: Any = None
-    current_tokens: list[str] = []
-
-    def flush() -> None:
-        if current_speaker is None:
-            return
-        body = " ".join(token for token in current_tokens if token != "")
-        paragraphs.append(f"Speaker {current_speaker}: {body}".rstrip())
-
-    for word in dict_words:
-        token = word.get("text")
-        if not isinstance(token, str):
-            token = ""
-        speaker = word["speaker"]
-        if current_speaker is None:
-            current_speaker = speaker
-            current_tokens = [token]
-            continue
-        if speaker != current_speaker:
-            flush()
-            current_speaker = speaker
-            current_tokens = [token]
-            continue
-        current_tokens.append(token)
-
-    flush()
-    if not paragraphs:
+    turns = _group_speaker_turns(dict_words)
+    if merge_turns:
+        turns = merge_flicker_turns(
+            turns,
+            min_turn_seconds=min_turn_seconds,
+            min_turn_words=min_turn_words,
+        )
+    labeled = _labeled_from_turns(turns)
+    if not labeled:
         return fallback_str
-    return "\n\n".join(paragraphs)
+    if not incomplete:
+        return labeled
+    if prefer_complete:
+        print(WORDS_INCOMPLETE_WARNING, file=sys.stderr)
+        return fallback_str
+    return f"{labeled}\n\n---\n{FULL_TEXT_HEADING}\n\n{fallback_str}"
 
 
 def request_transcription(
@@ -199,66 +532,98 @@ def request_transcription(
     language: str = DEFAULT_LANGUAGE,
     *,
     diarize: bool = True,
+    format_text: bool = True,
+    prepare: bool = True,
+    multichannel: bool = False,
+    model: str | None = None,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
     validate_input(path)
-    mime = MIME_TYPES[suffix_of(path)]
+    prepared: Path | None = None
+    send_path = path
+    if prepare and not multichannel:
+        prepared = prepare_stt_wav(path)
+        if prepared is not None:
+            send_path = prepared
+    mime = MIME_TYPES.get(suffix_of(send_path), "audio/wav")
     post = session.post if session is not None else requests.post
-    data = [("format", "true"), ("language", language)]
+    chosen_model = model or stt_model()
+    data: list[tuple[str, str]] = [("model", chosen_model)]
+    if format_text:
+        data.append(("format", "true"))
+    data.append(("language", language))
+    data.append(("filler_words", "true"))
     if diarize:
         data.append(("diarize", "true"))
+    if multichannel:
+        data.append(("multichannel", "true"))
     last_error: Exception | None = None
+    upload_name = path.name if send_path == path else f"{path.stem}.wav"
 
-    for attempt in range(1, 4):
-        try:
-            with path.open("rb") as handle:
-                response = post(
-                    STT_URL,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    data=data,
-                    files={"file": (path.name, handle, mime)},
-                    timeout=timeout_for(path),
+    try:
+        for attempt in range(1, 4):
+            try:
+                with send_path.open("rb") as handle:
+                    response = post(
+                        STT_URL,
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        data=data,
+                        files={"file": (upload_name, handle, mime)},
+                        timeout=timeout_for(path),
+                    )
+            except requests.RequestException as exc:
+                last_error = AudioToTextError(f"{path.name}: network error: {exc}")
+                log(f"network error attempt={attempt} file={path.name} error={exc}")
+                time.sleep(min(2 ** attempt, 8))
+                continue
+
+            if response.status_code in {429, 503}:
+                log(
+                    f"retryable status={response.status_code} "
+                    f"attempt={attempt} file={path.name}"
                 )
-        except requests.RequestException as exc:
-            last_error = AudioToTextError(f"{path.name}: network error: {exc}")
-            log(f"network error attempt={attempt} file={path.name} error={exc}")
-            time.sleep(min(2 ** attempt, 8))
-            continue
+                time.sleep(min(2 ** attempt, 8))
+                last_error = AudioToTextError(
+                    f"{path.name}: STT service busy (HTTP {response.status_code})"
+                )
+                continue
 
-        if response.status_code in {429, 503}:
-            log(f"retryable status={response.status_code} attempt={attempt} file={path.name}")
-            time.sleep(min(2 ** attempt, 8))
-            last_error = AudioToTextError(
-                f"{path.name}: STT service busy (HTTP {response.status_code})"
+            if response.status_code == 401:
+                raise AudioToTextError("STT API key is missing or invalid (HTTP 401)")
+            if response.status_code == 413:
+                raise AudioToTextError(f"{path.name}: file exceeds 500 MB (HTTP 413)")
+            if response.status_code >= 400:
+                detail = _response_detail(response)
+                raise AudioToTextError(
+                    f"{path.name}: STT request failed "
+                    f"(HTTP {response.status_code}){detail}"
+                )
+
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise AudioToTextError(f"{path.name}: STT returned non-JSON") from exc
+
+            if not isinstance(payload, dict):
+                raise AudioToTextError(f"{path.name}: STT returned non-object JSON")
+            if payload.get("text") is None and not payload.get("words"):
+                raise AudioToTextError(f"{path.name}: STT response missing text")
+            words = payload.get("words") if isinstance(payload.get("words"), list) else []
+            text = payload.get("text") if isinstance(payload.get("text"), str) else ""
+            reconstructed = join_word_texts(words)
+            log(
+                f"transcribed file={path.name} model={chosen_model} "
+                f"duration={payload.get('duration')} "
+                f"len(text)={len(text)} len(words)={len(words)} "
+                f"reconstructed={len(reconstructed)} "
+                f"prepared={prepared is not None} multichannel={multichannel}"
             )
-            continue
+            return payload
 
-        if response.status_code == 401:
-            raise AudioToTextError("STT API key is missing or invalid (HTTP 401)")
-        if response.status_code == 413:
-            raise AudioToTextError(f"{path.name}: file exceeds 500 MB (HTTP 413)")
-        if response.status_code >= 400:
-            detail = _response_detail(response)
-            raise AudioToTextError(
-                f"{path.name}: STT request failed (HTTP {response.status_code}){detail}"
-            )
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise AudioToTextError(f"{path.name}: STT returned non-JSON") from exc
-
-        if not isinstance(payload, dict):
-            raise AudioToTextError(f"{path.name}: STT returned non-object JSON")
-        if payload.get("text") is None and not payload.get("words"):
-            raise AudioToTextError(f"{path.name}: STT response missing text")
-        log(
-            f"transcribed file={path.name} duration={payload.get('duration')} "
-            f"language={payload.get('language')} words={len(payload.get('words') or [])}"
-        )
-        return payload
-
-    raise last_error or AudioToTextError(f"{path.name}: STT request failed")
+        raise last_error or AudioToTextError(f"{path.name}: STT request failed")
+    finally:
+        if prepared is not None:
+            prepared.unlink(missing_ok=True)
 
 
 def transcribe_file(
@@ -268,11 +633,32 @@ def transcribe_file(
     session: requests.Session | None = None,
     *,
     diarize: bool = True,
+    format_text: bool = True,
+    prepare: bool = True,
+    multichannel: bool = False,
+    merge_turns: bool = True,
+    min_turn_seconds: float = DEFAULT_MIN_TURN_SECONDS,
+    min_turn_words: int = DEFAULT_MIN_TURN_WORDS,
+    prefer_complete: bool = True,
 ) -> str:
     payload = request_transcription(
-        path, api_key, language=language, diarize=diarize, session=session
+        path,
+        api_key,
+        language=language,
+        diarize=diarize,
+        format_text=format_text,
+        prepare=prepare,
+        multichannel=multichannel,
+        session=session,
     )
-    return format_transcript(payload, use_diarization=diarize)
+    return format_transcript(
+        payload,
+        use_diarization=diarize,
+        merge_turns=merge_turns,
+        min_turn_seconds=min_turn_seconds,
+        min_turn_words=min_turn_words,
+        prefer_complete=prefer_complete,
+    )
 
 
 def json_sidecar_path(source: Path, json_out: str | None) -> Path | None:
@@ -355,6 +741,13 @@ def process_file(
     *,
     diarize: bool = True,
     json_out: str | None = None,
+    format_text: bool = True,
+    prepare: bool = True,
+    multichannel: bool = False,
+    merge_turns: bool = True,
+    min_turn_seconds: float = DEFAULT_MIN_TURN_SECONDS,
+    min_turn_words: int = DEFAULT_MIN_TURN_WORDS,
+    prefer_complete: bool = True,
 ) -> Path:
     dest = output_path_for(path)
     if dry_run:
@@ -362,12 +755,25 @@ def process_file(
         print(f"Would transcribe {path} -> {dest}")
         return dest
     payload = request_transcription(
-        path, api_key, language=language, diarize=diarize
+        path,
+        api_key,
+        language=language,
+        diarize=diarize,
+        format_text=format_text,
+        prepare=prepare,
+        multichannel=multichannel,
     )
     sidecar = json_sidecar_path(path, json_out)
     if sidecar is not None:
         write_json(sidecar, payload)
-    text = format_transcript(payload, use_diarization=diarize)
+    text = format_transcript(
+        payload,
+        use_diarization=diarize,
+        merge_turns=merge_turns,
+        min_turn_seconds=min_turn_seconds,
+        min_turn_words=min_turn_words,
+        prefer_complete=prefer_complete,
+    )
     written = write_transcript(path, text)
     print(written)
     if do_notify:
@@ -388,7 +794,7 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--notify",
         action="store_true",
-        help="Show a macOS notification (used by the Finder Quick Action)",
+        help="Show a macOS notification when the sidecar is written",
     )
     parser.add_argument(
         "--dry-run",
@@ -401,9 +807,62 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="Do not request speaker labels; write the merged text field",
     )
     parser.add_argument(
+        "--no-format",
+        action="store_true",
+        help="Omit format=true (inverse text normalization) for an STT completeness A/B",
+    )
+    parser.add_argument(
+        "--min-turn-seconds",
+        type=float,
+        default=DEFAULT_MIN_TURN_SECONDS,
+        metavar="SEC",
+        help=(
+            "Merge speaker turns shorter than this many seconds "
+            f"(default: {DEFAULT_MIN_TURN_SECONDS})"
+        ),
+    )
+    parser.add_argument(
+        "--min-turn-words",
+        type=int,
+        default=DEFAULT_MIN_TURN_WORDS,
+        metavar="N",
+        help=(
+            "Merge speaker turns with this many words or fewer "
+            f"(default: {DEFAULT_MIN_TURN_WORDS})"
+        ),
+    )
+    parser.add_argument(
+        "--no-merge-turns",
+        action="store_true",
+        help="Do not collapse short flicker turns into the adjacent speaker",
+    )
+    parser.add_argument(
+        "--prefer-complete",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When diarized words are shorter than text, write the complete text "
+            "(default: true)"
+        ),
+    )
+    parser.add_argument(
         "--json-out",
         metavar="PATH",
         help="Write raw STT JSON to PATH (or AUDIO_TO_TEXT_SAVE_JSON=1 for <stem>.stt.json)",
+    )
+    parser.add_argument(
+        "--multichannel",
+        action="store_true",
+        help=(
+            "Transcribe each audio channel separately (true split-channel "
+            "recordings). Skips 16 kHz mono prepare. Do not use on Voice Memos "
+            "or other mixed stereo — it duplicates every word."
+        ),
+    )
+    parser.add_argument(
+        "--no-prepare",
+        action="store_true",
+        help="Send the original file; do not convert to 16 kHz mono WAV first",
     )
     return parser.parse_args(argv)
 
@@ -432,6 +891,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 do_notify=args.notify,
                 diarize=not args.no_diarize,
                 json_out=args.json_out,
+                format_text=not args.no_format,
+                prepare=not args.no_prepare,
+                multichannel=args.multichannel,
+                merge_turns=not args.no_merge_turns,
+                min_turn_seconds=args.min_turn_seconds,
+                min_turn_words=args.min_turn_words,
+                prefer_complete=args.prefer_complete,
             )
         except AudioToTextError as exc:
             failures += 1

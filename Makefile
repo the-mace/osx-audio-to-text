@@ -15,26 +15,30 @@ install:  ## Install CLI + Finder Quick Action
 	else \
 		python3 -m pip install -e .; \
 	fi
-	@echo "$(BLUE)Creating audio-to-text symlink...$(RESET)"
-	@INSTALLED_PATH=$$(find /Library/Frameworks/Python.framework/Versions/*/bin/audio-to-text 2>/dev/null | head -1); \
-	if [ -z "$$INSTALLED_PATH" ]; then \
-		INSTALLED_PATH=$$(command -v audio-to-text || true); \
-	fi; \
-	if [ -n "$$INSTALLED_PATH" ]; then \
-		mkdir -p "$$HOME/.local/bin"; \
-		ln -sf "$$INSTALLED_PATH" "$$HOME/.local/bin/audio-to-text"; \
-		echo "  ✓ $$HOME/.local/bin/audio-to-text -> $$INSTALLED_PATH"; \
-		if ln -sf "$$INSTALLED_PATH" /usr/local/bin/audio-to-text 2>/dev/null; then \
-			echo "  ✓ /usr/local/bin/audio-to-text -> $$INSTALLED_PATH"; \
-		elif sudo -n ln -sf "$$INSTALLED_PATH" /usr/local/bin/audio-to-text 2>/dev/null; then \
-			echo "  ✓ /usr/local/bin/audio-to-text -> $$INSTALLED_PATH"; \
+	@echo "$(BLUE)Creating CLI symlinks...$(RESET)"
+	@for cmd in audio-to-text meeting-summary; do \
+		INSTALLED_PATH=$$(find /Library/Frameworks/Python.framework/Versions/*/bin/$$cmd 2>/dev/null | head -1); \
+		if [ -z "$$INSTALLED_PATH" ]; then \
+			INSTALLED_PATH=$$(command -v $$cmd || true); \
 		fi; \
-	else \
-		echo "  Warning: audio-to-text command not found after pip install"; \
-	fi
+		if [ -n "$$INSTALLED_PATH" ]; then \
+			mkdir -p "$$HOME/.local/bin"; \
+			ln -sf "$$INSTALLED_PATH" "$$HOME/.local/bin/$$cmd"; \
+			echo "  ✓ $$HOME/.local/bin/$$cmd -> $$INSTALLED_PATH"; \
+			if ln -sf "$$INSTALLED_PATH" /usr/local/bin/$$cmd 2>/dev/null; then \
+				echo "  ✓ /usr/local/bin/$$cmd -> $$INSTALLED_PATH"; \
+			elif sudo -n ln -sf "$$INSTALLED_PATH" /usr/local/bin/$$cmd 2>/dev/null; then \
+				echo "  ✓ /usr/local/bin/$$cmd -> $$INSTALLED_PATH"; \
+			fi; \
+		else \
+			echo "  Warning: $$cmd command not found after pip install"; \
+		fi; \
+	done
 	@$(MAKE) install-finder
 	@echo "$(BLUE)✓ Installed$(RESET)"
-	@echo "Usage: audio-to-text ~/Desktop/clip.mp4"
+	@echo "Usage: meeting-summary ~/Desktop/recording.m4a"
+	@echo "       audio-to-text ~/Desktop/clip.mp4   # sidecar .txt only"
+	@echo "Finder: right-click audio/MP4 → Quick Actions → Convert to Text"
 
 install-finder:  ## Sign+import Convert to Text Shortcuts Quick Action
 	@bash "$(CURDIR)/scripts/install-finder-action.sh"

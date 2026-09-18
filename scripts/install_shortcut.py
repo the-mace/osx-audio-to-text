@@ -246,7 +246,10 @@ def main() -> int:
         register_pbs(wid)
 
     print(f"Installed Shortcuts Quick Action: {NAME}")
-    print("Right-click an audio or MP4 file → Quick Actions → Convert to Text")
+    print(
+        "Right-click an audio or MP4 file → Quick Actions → Convert to Text "
+        "(writes <stem>/summary.md and transcript.txt)"
+    )
     return 0
 
 

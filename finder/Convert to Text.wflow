@@ -40,7 +40,7 @@
 					<dict>
 						<key>attachmentsByRange</key>
 						<dict>
-							<key>{207, 1}</key>
+							<key>{209, 1}</key>
 							<dict>
 								<key>Aggrandizements</key>
 								<array>
@@ -61,7 +61,7 @@
 						</dict>
 						<key>string</key>
 						<string>export PATH="$HOME/.local/bin:/Library/Frameworks/Python.framework/Versions/3.11/bin:/Library/Frameworks/Python.framework/Versions/Current/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
-audio-to-text --notify "￼"</string>
+meeting-summary --notify "￼"</string>
 					</dict>
 					<key>WFSerializationType</key>
 					<string>WFTextTokenString</string>

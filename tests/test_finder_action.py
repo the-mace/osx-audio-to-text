@@ -41,7 +41,8 @@ def test_shortcut_wflow_is_finder_quick_action() -> None:
     assert document["WFWorkflowHasShortcutInputVariables"] is True
     shell = document["WFWorkflowActions"][1]["WFWorkflowActionParameters"]
     script = shell["Script"]["Value"]["string"]
-    assert "audio-to-text" in script
+    assert "meeting-summary" in script
+    assert "audio-to-text" not in script
     assert "--notify" in script
     assert "GROK_API_KEY" not in script
     assert "xai-" not in script
@@ -56,7 +57,9 @@ def test_workflow_is_finder_quick_action() -> None:
     assert meta["workflowTypeIdentifier"] == "com.apple.Automator.workflowType.userAction"
     assert meta["serviceApplicationBundleID"] == "com.apple.finder"
     command = document["actions"][0]["action"]["ActionParameters"]["COMMAND_STRING"]
-    assert "audio-to-text" in command
+    assert "meeting-summary" in command
+    assert "bin/audio-to-text" not in command
+    assert command.count("meeting-summary") >= 8
     assert "--notify" in command
     assert "GROK_API_KEY" not in command
     assert "xai-" not in command

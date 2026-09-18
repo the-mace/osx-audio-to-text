@@ -65,16 +65,16 @@
 
 CMD=""
 for candidate in \
-  /usr/local/bin/audio-to-text \
-  /opt/homebrew/bin/audio-to-text \
-  "$HOME/.local/bin/audio-to-text" \
-  "$HOME/Library/Python/3.11/bin/audio-to-text" \
-  "$HOME/Library/Python/3.12/bin/audio-to-text" \
-  "$HOME/Library/Python/3.13/bin/audio-to-text" \
-  "$HOME/Library/Python/3.14/bin/audio-to-text" \
-  /Library/Frameworks/Python.framework/Versions/3.11/bin/audio-to-text \
-  /Library/Frameworks/Python.framework/Versions/3.12/bin/audio-to-text \
-  /Library/Frameworks/Python.framework/Versions/Current/bin/audio-to-text
+  /usr/local/bin/meeting-summary \
+  /opt/homebrew/bin/meeting-summary \
+  "$HOME/.local/bin/meeting-summary" \
+  "$HOME/Library/Python/3.11/bin/meeting-summary" \
+  "$HOME/Library/Python/3.12/bin/meeting-summary" \
+  "$HOME/Library/Python/3.13/bin/meeting-summary" \
+  "$HOME/Library/Python/3.14/bin/meeting-summary" \
+  /Library/Frameworks/Python.framework/Versions/3.11/bin/meeting-summary \
+  /Library/Frameworks/Python.framework/Versions/3.12/bin/meeting-summary \
+  /Library/Frameworks/Python.framework/Versions/Current/bin/meeting-summary
 do
   if [ -x "$candidate" ]; then
     CMD="$candidate"
@@ -83,7 +83,7 @@ do
 done
 
 if [ -z "$CMD" ]; then
-  osascript -e 'display alert "Convert to Text" message "audio-to-text is not installed. In the osx-audio-to-text repo, run make install."'
+  osascript -e 'display alert "Convert to Text" message "meeting-summary is not installed. In the osx-audio-to-text repo, run make install."'
   exit 1
 fi
 

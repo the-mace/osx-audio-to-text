@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "osx-audio-to-text"
 version = "1.0.0"
-description = "Finder Quick Action that transcribes audio/MP4 files to sidecar .txt via xAI Grok STT"
+description = "Finder Quick Action that writes a Grok meeting summary, plus audio-to-text and meeting-summary CLIs"
 authors = [
     {name = "Rob"}
 ]
@@ -23,7 +23,7 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
     "Topic :: Utilities",
 ]
-keywords = ["speech-to-text", "stt", "grok", "xai", "macos", "finder", "quick-action", "transcription"]
+keywords = ["speech-to-text", "stt", "grok", "xai", "macos", "finder", "quick-action", "transcription", "meeting-summary"]
 dependencies = [
     "requests>=2.31.0,<3.0.0",
 ]
@@ -37,6 +37,7 @@ dev = [
 
 [project.scripts]
 audio-to-text = "audio_to_text:main"
+meeting-summary = "meeting_summary:main"
 
 [project.urls]
 Homepage = "https://github.com/the-mace/osx-audio-to-text"
@@ -44,11 +45,14 @@ Issues = "https://github.com/the-mace/osx-audio-to-text/issues"
 Repository = "https://github.com/the-mace/osx-audio-to-text"
 
 [tool.setuptools]
-py-modules = ["audio_to_text"]
+py-modules = ["audio_to_text", "meeting_summary"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
+markers = [
+    "enable_prepare: run STT prepare_stt_wav instead of the autouse no-op",
+]
 addopts = [
     "-v",
     "--strict-markers",
