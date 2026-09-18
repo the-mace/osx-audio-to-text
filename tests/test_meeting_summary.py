@@ -167,3 +167,66 @@ def test_main_missing_key_is_nonzero(
     env_file.write_text("")
     rc = meeting_summary.main([str(audio_file)])
     assert rc == 1
+
+
+def test_main_notify_prints_status_not_path(
+    audio_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "secret-key")
+
+    def fake_post(url, **kwargs):
+        if url == audio_to_text.STT_URL:
+            return _FakeResponse(200, {"text": "We will ship Friday."})
+        if url == meeting_summary.CHAT_URL:
+            return _FakeResponse(200, _chat_payload("# Ship plan\n"))
+        raise AssertionError(url)
+
+    expected = "File clip.mp4 has been successfully transcribed and summarized"
+    with patch("audio_to_text.requests.post", side_effect=fake_post), patch(
+        "meeting_summary.requests.post", side_effect=fake_post
+    ), patch("audio_to_text.notify") as notify_mock:
+        rc = meeting_summary.main(["--notify", str(audio_file)])
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    assert out == expected
+    assert "summary.md" not in out
+    assert str(audio_file.parent) not in out
+    notify_mock.assert_called_once_with("Convert to Text", expected, error=False)
+
+
+def test_main_notify_error_prints_helpful_status(
+    audio_file: Path, env_file: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("GROK_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    env_file.write_text("")
+    with patch("audio_to_text.notify") as notify_mock:
+        rc = meeting_summary.main(["--notify", str(audio_file)])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "Could not transcribe and summarize clip.mp4:" in captured.out
+    assert "API key" in captured.out
+    assert str(audio_file.parent) not in captured.out
+    notify_mock.assert_called_once()
+    assert notify_mock.call_args.kwargs.get("error") is True
+
+
+def test_main_notify_from_transcript_says_summarized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "secret-key")
+    source = tmp_path / "notes.txt"
+    source.write_text("Speaker 0: Done.\n", encoding="utf-8")
+    session = MagicMock()
+    session.post.return_value = _FakeResponse(200, _chat_payload("# Notes\n"))
+    expected = "File notes.txt has been successfully summarized"
+    with patch("meeting_summary.requests.post", session.post), patch(
+        "audio_to_text.notify"
+    ) as notify_mock:
+        rc = meeting_summary.main(
+            ["--notify", "--from-transcript", str(source)]
+        )
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == expected
+    notify_mock.assert_called_once_with("Convert to Text", expected, error=False)

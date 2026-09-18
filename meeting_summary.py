@@ -263,9 +263,14 @@ def process_meeting(
         session=session,
     )
     written = write_text(summary_dest, markdown)
-    print(written)
     if do_notify:
-        audio_to_text.notify("Meeting summary", f"Wrote {written.name}")
+        audio_to_text.emit_notification(
+            audio_to_text.status_message(
+                path, summarized=True, from_transcript=from_transcript
+            )
+        )
+    else:
+        print(written)
     return written
 
 
@@ -307,7 +312,10 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--notify",
         action="store_true",
-        help="Show a macOS notification when the summary is written",
+        help=(
+            "macOS notification when finished; print a short status line "
+            "instead of the output path"
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -384,7 +392,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         except audio_to_text.AudioToTextError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             if args.notify:
-                audio_to_text.notify("Meeting summary", str(exc), error=True)
+                first = Path(args.files[0]).expanduser() if args.files else None
+                audio_to_text.emit_notification(
+                    audio_to_text.status_message(
+                        first,
+                        summarized=True,
+                        from_transcript=args.from_transcript,
+                        error=exc,
+                    ),
+                    error=True,
+                )
             return 1
 
     shared_out = Path(args.out).expanduser() if args.out else None
@@ -421,7 +438,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             audio_to_text.log(f"error file={path} error={exc}")
             print(f"Error: {exc}", file=sys.stderr)
             if args.notify:
-                audio_to_text.notify("Meeting summary", str(exc), error=True)
+                audio_to_text.emit_notification(
+                    audio_to_text.status_message(
+                        path,
+                        summarized=True,
+                        from_transcript=args.from_transcript,
+                        error=exc,
+                    ),
+                    error=True,
+                )
 
     return 1 if failures else 0
 

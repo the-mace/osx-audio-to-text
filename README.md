@@ -8,7 +8,9 @@ next to the file if you only want the transcript.
 
 Right-click a file in Finder → **Quick Actions** → **Convert to Text**.
 `Interview.mp4` becomes a folder `Interview/` with `summary.md` and
-`transcript.txt`.
+`transcript.txt`. When it finishes, a notification uses the filename only,
+for example `File Interview.mp4 has been successfully transcribed and
+summarized`. Failures use the same notification with a short reason.
 
 ```bash
 meeting-summary ~/Downloads/standup.m4a

@@ -775,23 +775,63 @@ def _applescript_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+NOTIFY_TITLE = "Convert to Text"
+
+
+def status_message(
+    path: Path | None,
+    *,
+    summarized: bool = False,
+    from_transcript: bool = False,
+    error: BaseException | str | None = None,
+) -> str:
+    """One-line Finder/notification status. Filename only, never a full path."""
+    if from_transcript:
+        done = "summarized"
+        fail = "summarize"
+    elif summarized:
+        done = "transcribed and summarized"
+        fail = "transcribe and summarize"
+    else:
+        done = "transcribed"
+        fail = "transcribe"
+
+    name = path.name if path is not None else None
+    if error is None:
+        if name:
+            return f"File {name} has been successfully {done}"
+        return f"File has been successfully {done}"
+
+    detail = str(error)
+    if path is not None:
+        for raw in (str(path), str(path.expanduser())):
+            if raw:
+                detail = detail.replace(raw, path.name)
+        labeled = f"{path.name}: "
+        if detail.startswith(labeled):
+            detail = detail[len(labeled):]
+    if name:
+        return f"Could not {fail} {name}: {detail}"
+    return f"Could not {fail}: {detail}"
+
+
 def notify(title: str, message: str, *, error: bool = False) -> None:
     title = " ".join(title.split())[:80]
     message = " ".join(message.split())[:400]
-    if error:
-        script = (
-            f"display alert {_applescript_quote(title)} "
-            f"message {_applescript_quote(message)}"
-        )
-    else:
-        script = (
-            f"display notification {_applescript_quote(message)} "
-            f"with title {_applescript_quote(title)}"
-        )
+    extra = ' subtitle "Failed"' if error else ""
+    script = (
+        f"display notification {_applescript_quote(message)} "
+        f"with title {_applescript_quote(title)}{extra}"
+    )
     try:
         subprocess.run(["osascript", "-e", script], check=False, capture_output=True)
     except OSError:
         pass
+
+
+def emit_notification(message: str, *, error: bool = False) -> None:
+    print(message)
+    notify(NOTIFY_TITLE, message, error=error)
 
 
 def process_file(
@@ -837,9 +877,10 @@ def process_file(
         prefer_complete=prefer_complete,
     )
     written = write_transcript(path, text)
-    print(written)
     if do_notify:
-        notify("Convert to Text", f"Wrote {written.name}")
+        emit_notification(status_message(path))
+    else:
+        print(written)
     return written
 
 
@@ -856,7 +897,10 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--notify",
         action="store_true",
-        help="Show a macOS notification when the sidecar is written",
+        help=(
+            "macOS notification when finished; print a short status line "
+            "instead of the output path"
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -939,7 +983,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         except AudioToTextError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             if args.notify:
-                notify("Convert to Text", str(exc), error=True)
+                first = Path(args.files[0]).expanduser() if args.files else None
+                emit_notification(status_message(first, error=exc), error=True)
             return 1
 
     for raw in args.files:
@@ -966,7 +1011,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             log(f"error file={path} error={exc}")
             print(f"Error: {exc}", file=sys.stderr)
             if args.notify:
-                notify("Convert to Text", str(exc), error=True)
+                emit_notification(status_message(path, error=exc), error=True)
 
     return 1 if failures else 0
 

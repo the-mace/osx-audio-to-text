@@ -861,3 +861,69 @@ def test_main_no_prefer_complete_appends_full_text(
         "Full STT text (no speakers)\n"
         "\n" + ("A" * 100) + "\n"
     )
+
+
+def test_status_message_success_uses_filename_only(tmp_path: Path) -> None:
+    path = tmp_path / "voicemail-ABC.m4a"
+    msg = audio_to_text.status_message(path)
+    assert msg == "File voicemail-ABC.m4a has been successfully transcribed"
+    assert str(tmp_path) not in msg
+
+
+def test_status_message_summarized_and_from_transcript() -> None:
+    path = Path("/Users/rob/Downloads/standup.m4a")
+    assert audio_to_text.status_message(path, summarized=True) == (
+        "File standup.m4a has been successfully transcribed and summarized"
+    )
+    assert audio_to_text.status_message(
+        path, summarized=True, from_transcript=True
+    ) == "File standup.m4a has been successfully summarized"
+
+
+def test_status_message_error_strips_full_path(tmp_path: Path) -> None:
+    path = tmp_path / "clip.mp4"
+    err = audio_to_text.AudioToTextError(f"File not found: {path}")
+    msg = audio_to_text.status_message(path, error=err)
+    assert msg == f"Could not transcribe {path.name}: File not found: {path.name}"
+    assert str(tmp_path) not in msg
+    labeled = audio_to_text.AudioToTextError(f"{path.name}: STT request failed (HTTP 500)")
+    assert audio_to_text.status_message(path, summarized=True, error=labeled) == (
+        "Could not transcribe and summarize clip.mp4: STT request failed (HTTP 500)"
+    )
+
+
+def test_main_notify_prints_status_not_path(
+    audio_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "secret-key")
+    fake = _FakeResponse(200, {"text": "Hello."})
+    with patch("audio_to_text.requests.post", return_value=fake), patch(
+        "audio_to_text.notify"
+    ) as notify_mock:
+        rc = audio_to_text.main(["--notify", str(audio_file)])
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    expected = "File clip.mp4 has been successfully transcribed"
+    assert out == expected
+    assert str(audio_file.parent) not in out
+    notify_mock.assert_called_once_with("Convert to Text", expected, error=False)
+
+
+def test_main_notify_error_prints_helpful_status(
+    audio_file: Path, env_file: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("GROK_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    env_file.write_text("")
+    with patch("audio_to_text.notify") as notify_mock:
+        rc = audio_to_text.main(["--notify", str(audio_file)])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "Could not transcribe clip.mp4:" in captured.out
+    assert "API key" in captured.out
+    assert str(audio_file.parent) not in captured.out
+    assert "Error:" in captured.err
+    notify_mock.assert_called_once()
+    assert notify_mock.call_args.kwargs.get("error") is True
+    assert "Could not transcribe clip.mp4:" in notify_mock.call_args.args[1]
