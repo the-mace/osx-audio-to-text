@@ -39,9 +39,21 @@ def test_shortcut_wflow_is_finder_quick_action() -> None:
     assert document["WFQuickActionSurfaces"] == ["Finder"]
     assert document["WFWorkflowInputContentItemClasses"] == ["WFAVAssetContentItem"]
     assert document["WFWorkflowHasShortcutInputVariables"] is True
-    shell = document["WFWorkflowActions"][1]["WFWorkflowActionParameters"]
+    actions = document["WFWorkflowActions"]
+    identifiers = [action["WFWorkflowActionIdentifier"] for action in actions]
+    # The shell script runs once, after the loop that collects every path.
+    assert identifiers.count("is.workflow.actions.runshellscript") == 1
+    shell_index = identifiers.index("is.workflow.actions.runshellscript")
+    assert shell_index > max(
+        i for i, name in enumerate(identifiers) if name == "is.workflow.actions.repeat.each"
+    )
+    shell = actions[shell_index]["WFWorkflowActionParameters"]
     script = shell["Script"]["Value"]["string"]
-    assert "meeting-summary" in script
+    (attachment,) = shell["Script"]["Value"]["attachmentsByRange"].items()
+    offset = int(attachment[0].strip("{}").split(",")[0])
+    assert script.encode("utf-16-le")[offset * 2:offset * 2 + 2].decode("utf-16-le") == "\ufffc"
+    assert attachment[1]["OutputName"] == "Repeat Results"
+    assert "meeting-summary --notify --join" in script
     assert "audio-to-text" not in script
     assert "--notify" in script
     assert "GROK_API_KEY" not in script
@@ -60,7 +72,7 @@ def test_workflow_is_finder_quick_action() -> None:
     assert "meeting-summary" in command
     assert "bin/audio-to-text" not in command
     assert command.count("meeting-summary") >= 8
-    assert "--notify" in command
+    assert '--notify --join "$@"' in command
     assert "GROK_API_KEY" not in command
     assert "xai-" not in command
 

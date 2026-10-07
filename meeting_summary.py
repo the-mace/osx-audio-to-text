@@ -182,6 +182,7 @@ def transcribe_recording(
     min_turn_words: int = audio_to_text.DEFAULT_MIN_TURN_WORDS,
     prefer_complete: bool = True,
     session: requests.Session | None = None,
+    extra_parts: Sequence[Path] = (),
 ) -> str:
     return audio_to_text.transcribe_file(
         path,
@@ -196,6 +197,7 @@ def transcribe_recording(
         min_turn_seconds=min_turn_seconds,
         min_turn_words=min_turn_words,
         prefer_complete=prefer_complete,
+        extra_parts=extra_parts,
     )
 
 
@@ -218,6 +220,7 @@ def process_meeting(
     min_turn_words: int = audio_to_text.DEFAULT_MIN_TURN_WORDS,
     prefer_complete: bool = True,
     session: requests.Session | None = None,
+    extra_parts: Sequence[Path] = (),
 ) -> Path:
     dest_dir = output_dir if output_dir is not None else default_output_dir(path)
     transcript_dest = transcript_path_for(dest_dir)
@@ -227,8 +230,10 @@ def process_meeting(
             if not path.exists() or not path.is_file():
                 raise MeetingSummaryError(f"File not found: {path}")
         else:
-            audio_to_text.validate_input(path)
-        print(f"Would transcribe {path} -> {transcript_dest}")
+            for part in (path, *extra_parts):
+                audio_to_text.validate_input(part)
+        source = " + ".join(str(part) for part in (path, *extra_parts))
+        print(f"Would transcribe {source} -> {transcript_dest}")
         print(f"Would summarize -> {summary_dest}")
         return summary_dest
 
@@ -253,6 +258,7 @@ def process_meeting(
             min_turn_words=min_turn_words,
             prefer_complete=prefer_complete,
             session=session,
+            extra_parts=extra_parts,
         )
     write_text(transcript_dest, transcript)
     markdown = request_summary(
@@ -266,7 +272,10 @@ def process_meeting(
     if do_notify:
         audio_to_text.emit_notification(
             audio_to_text.status_message(
-                path, summarized=True, from_transcript=from_transcript
+                path,
+                summarized=True,
+                from_transcript=from_transcript,
+                joined=len(extra_parts),
             )
         )
     else:
@@ -321,6 +330,14 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Validate inputs and print output paths without calling the API",
+    )
+    parser.add_argument(
+        "--join",
+        action="store_true",
+        help=(
+            "Treat the recordings as parts of one meeting: join them in "
+            "filename order and write one summary named after the first part"
+        ),
     )
     parser.add_argument(
         "--no-diarize",
@@ -379,7 +396,10 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "(default: true)"
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.join and args.from_transcript:
+        parser.error("--join cannot be combined with --from-transcript")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -405,9 +425,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
 
     shared_out = Path(args.out).expanduser() if args.out else None
-    multiple = len(args.files) > 1
-    for raw in args.files:
-        path = Path(raw).expanduser()
+    jobs = audio_to_text.plan_jobs(args.files, join=args.join)
+    multiple = len(jobs) > 1
+    for path, extra_parts in jobs:
         if shared_out is None:
             dest_dir = None
         elif multiple:
@@ -432,6 +452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 min_turn_seconds=args.min_turn_seconds,
                 min_turn_words=args.min_turn_words,
                 prefer_complete=args.prefer_complete,
+                extra_parts=extra_parts,
             )
         except audio_to_text.AudioToTextError as exc:
             failures += 1
@@ -444,6 +465,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         summarized=True,
                         from_transcript=args.from_transcript,
                         error=exc,
+                        joined=len(extra_parts),
                     ),
                     error=True,
                 )

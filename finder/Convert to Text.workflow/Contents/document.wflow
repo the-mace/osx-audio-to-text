@@ -87,13 +87,7 @@ if [ -z "$CMD" ]; then
   exit 1
 fi
 
-status=0
-for f in "$@"; do
-  if ! "$CMD" --notify "$f"; then
-    status=1
-  fi
-done
-exit "$status"</string>
+exec "$CMD" --notify --join "$@"</string>
 					<key>CheckedForUserDefaultShell</key>
 					<true/>
 					<key>inputMethod</key>

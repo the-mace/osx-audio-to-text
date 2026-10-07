@@ -18,6 +18,10 @@ Finder Quick Action, xAI only.
   `ffmpeg -i file.qta -map 0:a:0 -c:a copy file.m4a`, then the usual
   16 kHz mono prepare. ffmpeg is required for `.qta`. Do not send the
   `.qta` file to STT.
+- `--join` (both CLIs) treats all inputs as parts of one recording:
+  ffmpeg concatenates them in natural filename order into one 16 kHz
+  mono WAV and STT sees a single file. Output is named after the first
+  part. Without `--join`, multiple inputs stay separate jobs.
 - Default summary model is `grok-4.20-0309-non-reasoning` (same family as
   `osx-file-renamer`). Override with `--model` or `MEETING_SUMMARY_MODEL`.
 - `audio-to-text` writes a sidecar `.txt` next to the recording.
@@ -27,8 +31,9 @@ Finder Quick Action, xAI only.
 - API keys live in the environment or `~/.env` as `GROK_API_KEY` or
   `XAI_API_KEY`. Never commit secrets.
 - Finder action name is **Convert to Text**. It runs `meeting-summary
-  --notify` (folder with `summary.md` + `transcript.txt`), not the sidecar
-  CLI. Input is Shortcuts `WFAVAssetContentItem` (audio + MP4). Do not
+  --notify --join` (folder with `summary.md` + `transcript.txt`), not the
+  sidecar CLI. A multi-file selection is one recording: the shortcut
+  collects every path in its loop and runs the command once after it. Input is Shortcuts `WFAVAssetContentItem` (audio + MP4). Do not
   show it for PDFs, images, or text.
 - The reproducible artifact is `finder/Convert to Text.wflow`. `make install`
   signs it (`shortcuts sign --mode anyone`), imports/replaces the Shortcuts

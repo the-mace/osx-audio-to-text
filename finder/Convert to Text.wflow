@@ -31,16 +31,18 @@
 		</dict>
 		<dict>
 			<key>WFWorkflowActionIdentifier</key>
-			<string>is.workflow.actions.runshellscript</string>
+			<string>is.workflow.actions.gettext</string>
 			<key>WFWorkflowActionParameters</key>
 			<dict>
-				<key>Script</key>
+				<key>UUID</key>
+				<string>E5F6A7B8-C9D0-1234-EF12-345678901234</string>
+				<key>WFTextActionText</key>
 				<dict>
 					<key>Value</key>
 					<dict>
 						<key>attachmentsByRange</key>
 						<dict>
-							<key>{209, 1}</key>
+							<key>{0, 1}</key>
 							<dict>
 								<key>Aggrandizements</key>
 								<array>
@@ -60,8 +62,56 @@
 							</dict>
 						</dict>
 						<key>string</key>
+						<string>￼</string>
+					</dict>
+					<key>WFSerializationType</key>
+					<string>WFTextTokenString</string>
+				</dict>
+			</dict>
+		</dict>
+		<dict>
+			<key>WFWorkflowActionIdentifier</key>
+			<string>is.workflow.actions.repeat.each</string>
+			<key>WFWorkflowActionParameters</key>
+			<dict>
+				<key>GroupingIdentifier</key>
+				<string>A1B2C3D4-E5F6-7890-ABCD-EF1234567890</string>
+				<key>UUID</key>
+				<string>C3D4E5F6-A7B8-9012-CDEF-123456789012</string>
+				<key>WFControlFlowMode</key>
+				<integer>2</integer>
+			</dict>
+		</dict>
+		<dict>
+			<key>WFWorkflowActionIdentifier</key>
+			<string>is.workflow.actions.runshellscript</string>
+			<key>WFWorkflowActionParameters</key>
+			<dict>
+				<key>Script</key>
+				<dict>
+					<key>Value</key>
+					<dict>
+						<key>attachmentsByRange</key>
+						<dict>
+							<key>{288, 1}</key>
+							<dict>
+								<key>OutputName</key>
+								<string>Repeat Results</string>
+								<key>OutputUUID</key>
+								<string>C3D4E5F6-A7B8-9012-CDEF-123456789012</string>
+								<key>Type</key>
+								<string>ActionOutput</string>
+							</dict>
+						</dict>
+						<key>string</key>
 						<string>export PATH="$HOME/.local/bin:/Library/Frameworks/Python.framework/Versions/3.11/bin:/Library/Frameworks/Python.framework/Versions/Current/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
-meeting-summary --notify "￼"</string>
+files=()
+while IFS= read -r line; do
+  [ -n "$line" ] &amp;&amp; files+=("$line")
+done &lt;&lt;'CONVERT_TO_TEXT_FILES'
+￼
+CONVERT_TO_TEXT_FILES
+meeting-summary --notify --join "${files[@]}"</string>
 					</dict>
 					<key>WFSerializationType</key>
 					<string>WFTextTokenString</string>
@@ -99,19 +149,6 @@ meeting-summary --notify "￼"</string>
 					<key>WFSerializationType</key>
 					<string>WFTextTokenString</string>
 				</dict>
-			</dict>
-		</dict>
-		<dict>
-			<key>WFWorkflowActionIdentifier</key>
-			<string>is.workflow.actions.repeat.each</string>
-			<key>WFWorkflowActionParameters</key>
-			<dict>
-				<key>GroupingIdentifier</key>
-				<string>A1B2C3D4-E5F6-7890-ABCD-EF1234567890</string>
-				<key>UUID</key>
-				<string>C3D4E5F6-A7B8-9012-CDEF-123456789012</string>
-				<key>WFControlFlowMode</key>
-				<integer>2</integer>
 			</dict>
 		</dict>
 	</array>

@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,7 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import requests
 
@@ -267,6 +269,95 @@ def prepare_stt_wav(path: Path) -> Path | None:
         return None
     log(f"prepared 16kHz mono wav file={path.name} bytes={dest.stat().st_size}")
     return dest
+
+
+def natural_sort_key(path: Path) -> tuple[list[Any], str]:
+    """Order "Call.m4a", "Call 2.m4a", "Call 10.m4a" the way Finder does."""
+    parts = re.split(r"(\d+)", path.stem.lower())
+    return [int(part) if part.isdigit() else part for part in parts], path.name
+
+
+def order_parts(paths: Sequence[Path]) -> list[Path]:
+    return sorted(paths, key=natural_sort_key)
+
+
+def join_recordings(paths: Sequence[Path], *, mono: bool = True) -> Path:
+    """Concatenate recordings into one 16 kHz WAV named after the first part.
+
+    The WAV lives in its own temp directory so it can keep the first part's
+    stem. The caller removes that directory.
+    """
+    for path in paths:
+        validate_input(path)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise AudioToTextError(
+            "ffmpeg is required to join recordings. Install ffmpeg and retry."
+        )
+    names = " + ".join(path.name for path in paths)
+    unwrapped: list[Path] = []
+    workdir = Path(tempfile.mkdtemp(prefix="audio_to_text_join_"))
+    dest = workdir / f"{paths[0].stem}.wav"
+    try:
+        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+        for path in paths:
+            source = path
+            if suffix_of(path) == ".qta":
+                source = unwrap_qta(path)
+                unwrapped.append(source)
+            command += ["-i", str(source)]
+        inputs = "".join(f"[{index}:a:0]" for index in range(len(paths)))
+        command += [
+            "-filter_complex",
+            f"{inputs}concat=n={len(paths)}:v=0:a=1[joined]",
+            "-map",
+            "[joined]",
+        ]
+        if mono:
+            command += ["-ac", "1"]
+        command += ["-ar", str(STT_SAMPLE_RATE), "-c:a", "pcm_s16le", str(dest)]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=sum(timeout_for(path) for path in paths),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AudioToTextError(f"Could not join {names}: {exc}") from exc
+        if completed.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+            err = (completed.stderr or "").strip().replace("\n", " ")[:200]
+            detail = f": {err}" if err else ""
+            raise AudioToTextError(f"Could not join {names}{detail}")
+        size = dest.stat().st_size
+        if size > MAX_FILE_BYTES:
+            raise AudioToTextError(
+                f"{names} joined is {size} bytes; Grok STT accepts at most 500 MB"
+            )
+    except BaseException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+    finally:
+        for temp in unwrapped:
+            temp.unlink(missing_ok=True)
+    log(f"joined {len(paths)} files into {dest.name} bytes={size} parts={names}")
+    return dest
+
+
+@contextlib.contextmanager
+def stt_source(
+    path: Path, extra_parts: Sequence[Path] = (), *, multichannel: bool = False
+) -> Iterator[Path]:
+    """Yield the file to send to STT: ``path``, or it joined with ``extra_parts``."""
+    if not extra_parts:
+        yield path
+        return
+    joined = join_recordings([path, *extra_parts], mono=not multichannel)
+    try:
+        yield joined
+    finally:
+        shutil.rmtree(joined.parent, ignore_errors=True)
 
 
 def validate_input(path: Path) -> None:
@@ -702,17 +793,20 @@ def transcribe_file(
     min_turn_seconds: float = DEFAULT_MIN_TURN_SECONDS,
     min_turn_words: int = DEFAULT_MIN_TURN_WORDS,
     prefer_complete: bool = True,
+    extra_parts: Sequence[Path] = (),
 ) -> str:
-    payload = request_transcription(
-        path,
-        api_key,
-        language=language,
-        diarize=diarize,
-        format_text=format_text,
-        prepare=prepare,
-        multichannel=multichannel,
-        session=session,
-    )
+    with stt_source(path, extra_parts, multichannel=multichannel) as source:
+        payload = request_transcription(
+            source,
+            api_key,
+            language=language,
+            diarize=diarize,
+            format_text=format_text,
+            # A joined file is already 16 kHz mono WAV.
+            prepare=prepare and not extra_parts,
+            multichannel=multichannel,
+            session=session,
+        )
     return format_transcript(
         payload,
         use_diarization=diarize,
@@ -784,8 +878,12 @@ def status_message(
     summarized: bool = False,
     from_transcript: bool = False,
     error: BaseException | str | None = None,
+    joined: int = 0,
 ) -> str:
-    """One-line Finder/notification status. Filename only, never a full path."""
+    """One-line Finder/notification status. Filename only, never a full path.
+
+    ``joined`` is how many further recordings were joined onto ``path``.
+    """
     if from_transcript:
         done = "summarized"
         fail = "summarize"
@@ -797,6 +895,8 @@ def status_message(
         fail = "transcribe"
 
     name = path.name if path is not None else None
+    if name and joined:
+        name = f"{name} (+{joined} joined)"
     if error is None:
         if name:
             return f"File {name} has been successfully {done}"
@@ -850,21 +950,26 @@ def process_file(
     min_turn_seconds: float = DEFAULT_MIN_TURN_SECONDS,
     min_turn_words: int = DEFAULT_MIN_TURN_WORDS,
     prefer_complete: bool = True,
+    extra_parts: Sequence[Path] = (),
 ) -> Path:
     dest = output_path_for(path)
     if dry_run:
-        validate_input(path)
-        print(f"Would transcribe {path} -> {dest}")
+        for part in (path, *extra_parts):
+            validate_input(part)
+        source = " + ".join(str(part) for part in (path, *extra_parts))
+        print(f"Would transcribe {source} -> {dest}")
         return dest
-    payload = request_transcription(
-        path,
-        api_key,
-        language=language,
-        diarize=diarize,
-        format_text=format_text,
-        prepare=prepare,
-        multichannel=multichannel,
-    )
+    with stt_source(path, extra_parts, multichannel=multichannel) as source:
+        payload = request_transcription(
+            source,
+            api_key,
+            language=language,
+            diarize=diarize,
+            format_text=format_text,
+            # A joined file is already 16 kHz mono WAV.
+            prepare=prepare and not extra_parts,
+            multichannel=multichannel,
+        )
     sidecar = json_sidecar_path(path, json_out)
     if sidecar is not None:
         write_json(sidecar, payload)
@@ -878,7 +983,7 @@ def process_file(
     )
     written = write_transcript(path, text)
     if do_notify:
-        emit_notification(status_message(path))
+        emit_notification(status_message(path, joined=len(extra_parts)))
     else:
         print(written)
     return written
@@ -906,6 +1011,14 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Validate inputs and print output paths without calling the API",
+    )
+    parser.add_argument(
+        "--join",
+        action="store_true",
+        help=(
+            "Treat the files as parts of one recording: join them in filename "
+            "order and write one transcript named after the first part"
+        ),
     )
     parser.add_argument(
         "--no-diarize",
@@ -973,6 +1086,15 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def plan_jobs(files: Sequence[str], *, join: bool) -> list[tuple[Path, list[Path]]]:
+    """Pair each output with (first part, further parts to join onto it)."""
+    paths = [Path(raw).expanduser() for raw in files]
+    if not join:
+        return [(path, []) for path in paths]
+    ordered = order_parts(paths)
+    return [(ordered[0], ordered[1:])]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     failures = 0
@@ -987,8 +1109,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 emit_notification(status_message(first, error=exc), error=True)
             return 1
 
-    for raw in args.files:
-        path = Path(raw).expanduser()
+    for path, extra_parts in plan_jobs(args.files, join=args.join):
         try:
             process_file(
                 path,
@@ -1005,13 +1126,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 min_turn_seconds=args.min_turn_seconds,
                 min_turn_words=args.min_turn_words,
                 prefer_complete=args.prefer_complete,
+                extra_parts=extra_parts,
             )
         except AudioToTextError as exc:
             failures += 1
             log(f"error file={path} error={exc}")
             print(f"Error: {exc}", file=sys.stderr)
             if args.notify:
-                emit_notification(status_message(path, error=exc), error=True)
+                emit_notification(
+                    status_message(path, error=exc, joined=len(extra_parts)),
+                    error=True,
+                )
 
     return 1 if failures else 0
 

@@ -230,3 +230,57 @@ def test_main_notify_from_transcript_says_summarized(
     assert rc == 0
     assert capsys.readouterr().out.strip() == expected
     notify_mock.assert_called_once_with("Convert to Text", expected, error=False)
+
+
+def test_main_join_writes_one_summary_for_all_parts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "secret-key")
+    first = tmp_path / "Call.m4a"
+    second = tmp_path / "Call 2.m4a"
+    first.write_bytes(b"part-one")
+    second.write_bytes(b"part-two")
+    workdir = tmp_path / "joined"
+    workdir.mkdir()
+    joined_calls: list[list[Path]] = []
+
+    def fake_join(paths, *, mono=True):
+        joined_calls.append(list(paths))
+        dest = workdir / "Call.wav"
+        dest.write_bytes(b"RIFFjoined")
+        return dest
+
+    stt_uploads: list[str] = []
+
+    def fake_post(url, **kwargs):
+        if url == audio_to_text.STT_URL:
+            stt_uploads.append(kwargs["files"]["file"][0])
+            return _FakeResponse(200, {"text": "First half. Second half."})
+        if url == meeting_summary.CHAT_URL:
+            return _FakeResponse(200, _chat_payload("# Whole call\n"))
+        raise AssertionError(url)
+
+    monkeypatch.setattr(audio_to_text, "join_recordings", fake_join)
+    expected = (
+        "File Call.m4a (+1 joined) has been successfully transcribed and summarized"
+    )
+    with patch("audio_to_text.requests.post", side_effect=fake_post), patch(
+        "meeting_summary.requests.post", side_effect=fake_post
+    ), patch("audio_to_text.notify"):
+        rc = meeting_summary.main(["--notify", "--join", str(second), str(first)])
+    assert rc == 0
+    assert joined_calls == [[first, second]]
+    assert stt_uploads == ["Call.wav"]
+    out = tmp_path / "Call"
+    assert (out / "transcript.txt").read_text(encoding="utf-8") == (
+        "First half. Second half.\n"
+    )
+    assert (out / "summary.md").read_text(encoding="utf-8") == "# Whole call\n"
+    assert not (tmp_path / "Call 2").exists()
+    assert not workdir.exists()
+    assert capsys.readouterr().out.strip() == expected
+
+
+def test_join_rejects_from_transcript(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        meeting_summary.parse_args(["--join", "--from-transcript", "a.txt", "b.txt"])

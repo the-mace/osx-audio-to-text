@@ -927,3 +927,139 @@ def test_main_notify_error_prints_helpful_status(
     notify_mock.assert_called_once()
     assert notify_mock.call_args.kwargs.get("error") is True
     assert "Could not transcribe clip.mp4:" in notify_mock.call_args.args[1]
+
+
+def test_order_parts_matches_finder_numbering(tmp_path: Path) -> None:
+    names = ["Call 10.m4a", "Call 2.m4a", "Call.m4a"]
+    ordered = audio_to_text.order_parts([tmp_path / name for name in names])
+    assert [path.name for path in ordered] == ["Call.m4a", "Call 2.m4a", "Call 10.m4a"]
+
+
+def test_plan_jobs_join_is_one_job(tmp_path: Path) -> None:
+    files = [str(tmp_path / "b.m4a"), str(tmp_path / "a.m4a")]
+    assert audio_to_text.plan_jobs(files, join=False) == [
+        (tmp_path / "b.m4a", []),
+        (tmp_path / "a.m4a", []),
+    ]
+    assert audio_to_text.plan_jobs(files, join=True) == [
+        (tmp_path / "a.m4a", [tmp_path / "b.m4a"])
+    ]
+    assert audio_to_text.plan_jobs(files[:1], join=True) == [(tmp_path / "b.m4a", [])]
+
+
+def _two_parts(tmp_path: Path) -> tuple[Path, Path]:
+    first = tmp_path / "Call.m4a"
+    second = tmp_path / "Call 2.m4a"
+    first.write_bytes(b"part-one")
+    second.write_bytes(b"part-two")
+    return first, second
+
+
+def test_join_recordings_runs_ffmpeg_concat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, second = _two_parts(tmp_path)
+    monkeypatch.setattr(audio_to_text.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        Path(command[-1]).write_bytes(b"RIFFjoined")
+        return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr(audio_to_text.subprocess, "run", fake_run)
+    joined = audio_to_text.join_recordings([first, second])
+    try:
+        command = seen["command"]
+        assert joined.name == "Call.wav"
+        assert joined.parent != tmp_path
+        assert [command[i + 1] for i, arg in enumerate(command) if arg == "-i"] == [
+            str(first),
+            str(second),
+        ]
+        graph = command[command.index("-filter_complex") + 1]
+        assert graph == "[0:a:0][1:a:0]concat=n=2:v=0:a=1[joined]"
+        assert command[command.index("-ac") + 1] == "1"
+        assert command[command.index("-ar") + 1] == "16000"
+    finally:
+        audio_to_text.shutil.rmtree(joined.parent)
+
+
+def test_join_recordings_requires_ffmpeg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, second = _two_parts(tmp_path)
+    monkeypatch.setattr(audio_to_text.shutil, "which", lambda name: None)
+    with pytest.raises(audio_to_text.AudioToTextError, match="ffmpeg is required to join"):
+        audio_to_text.join_recordings([first, second])
+
+
+def test_join_recordings_failure_names_parts_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, second = _two_parts(tmp_path)
+    monkeypatch.setattr(audio_to_text.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    workdirs: list[Path] = []
+
+    def fake_run(command, **kwargs):
+        workdirs.append(Path(command[-1]).parent)
+        return MagicMock(returncode=1, stderr="Invalid data found")
+
+    monkeypatch.setattr(audio_to_text.subprocess, "run", fake_run)
+    with pytest.raises(
+        audio_to_text.AudioToTextError,
+        match=r"Could not join Call\.m4a \+ Call 2\.m4a: Invalid data found",
+    ):
+        audio_to_text.join_recordings([first, second])
+    assert workdirs and not workdirs[0].exists()
+
+
+def test_main_join_writes_one_txt_named_after_first_part(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first, second = _two_parts(tmp_path)
+    monkeypatch.setenv("XAI_API_KEY", "secret-key")
+    workdir = tmp_path / "joined"
+    workdir.mkdir()
+    joined_calls: list[list[Path]] = []
+
+    def fake_join(paths, *, mono=True):
+        joined_calls.append(list(paths))
+        dest = workdir / "Call.wav"
+        dest.write_bytes(b"RIFFjoined")
+        return dest
+
+    uploads: list[tuple[str, bytes]] = []
+
+    def fake_post(url, **kwargs):
+        name, handle, _mime = kwargs["files"]["file"]
+        uploads.append((name, handle.read()))
+        return _FakeResponse(200, {"text": "Both halves."})
+
+    monkeypatch.setattr(audio_to_text, "join_recordings", fake_join)
+    expected = "File Call.m4a (+1 joined) has been successfully transcribed"
+    with patch("audio_to_text.requests.post", side_effect=fake_post), patch(
+        "audio_to_text.notify"
+    ):
+        # Reverse order on the command line: parts are joined in name order.
+        rc = audio_to_text.main(["--notify", "--join", str(second), str(first)])
+    assert rc == 0
+    assert joined_calls == [[first, second]]
+    assert uploads == [("Call.wav", b"RIFFjoined")]
+    assert (tmp_path / "Call.txt").read_text(encoding="utf-8") == "Both halves.\n"
+    assert not (tmp_path / "Call 2.txt").exists()
+    assert not workdir.exists()
+    assert capsys.readouterr().out.strip() == expected
+
+
+def test_main_without_join_keeps_one_txt_per_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, second = _two_parts(tmp_path)
+    monkeypatch.setenv("XAI_API_KEY", "secret-key")
+    fake = _FakeResponse(200, {"text": "One half."})
+    with patch("audio_to_text.requests.post", return_value=fake):
+        rc = audio_to_text.main([str(first), str(second)])
+    assert rc == 0
+    assert (tmp_path / "Call.txt").is_file()
+    assert (tmp_path / "Call 2.txt").is_file()

@@ -8,7 +8,7 @@ next to the file if you only want the transcript.
 
 Right-click a file in Finder → **Quick Actions** → **Convert to Text**.
 `Interview.mp4` becomes a folder `Interview/` with `summary.md` and
-`transcript.txt`. The action runs `meeting-summary --notify` and posts a
+`transcript.txt`. The action runs `meeting-summary --notify --join` and posts a
 macOS notification titled **Convert to Text** using the filename only
 (never a full path).
 
@@ -17,6 +17,11 @@ meeting-summary ~/Downloads/standup.m4a
 # writes ~/Downloads/standup/summary.md
 #        ~/Downloads/standup/transcript.txt
 ```
+
+Select several files and run the action once to treat them as one
+recording (a call that got split in two): they are joined in filename
+order, and a single `summary.md` / `transcript.txt` is written to a
+folder named after the first part. See [Joining split recordings](#joining-split-recordings).
 
 The action is registered only for audio files and MP4/MKV. It does not appear
 for PDFs, images, or other non-audio types. `.qta` is CLI-only.
@@ -60,7 +65,7 @@ make install
 ```
 
 That installs the `audio-to-text` and `meeting-summary` commands and recreates the **Convert to Text**
-Finder Quick Action (`meeting-summary --notify`) from `finder/Convert to Text.wflow` in this repo:
+Finder Quick Action (`meeting-summary --notify --join`) from `finder/Convert to Text.wflow` in this repo:
 
 1. `shortcuts sign --mode anyone` (so the file is valid on any Mac)
 2. Import or **Replace** the Shortcuts item
@@ -95,6 +100,27 @@ meeting-summary --notify standup.m4a         # Finder uses this
 audio-to-text --notify clip.m4a
 ```
 
+### Joining split recordings
+
+```bash
+meeting-summary --join "Call.m4a" "Call 2.m4a"
+# writes Call/summary.md and Call/transcript.txt for the whole call
+audio-to-text --join "Call.m4a" "Call 2.m4a"
+# writes Call.txt
+```
+
+`--join` treats every file on the command line as a part of one
+recording. ffmpeg (required) concatenates them into a single 16 kHz mono
+WAV, which is sent to STT as one file, so speaker labels stay consistent
+across the parts. Parts are joined in filename order, not argument
+order: `Call.m4a`, `Call 2.m4a`, `Call 10.m4a`. Rename the files if that
+is not the recording order. Output is named after the first part. The
+parts can be different formats; the 500 MB limit applies to the joined
+WAV (about 4.5 hours). Without `--join`, several files are still
+transcribed separately. The Finder action always passes `--join`, so
+run it once per recording rather than on a batch of unrelated files.
+`--join` cannot be combined with `--from-transcript`.
+
 `meeting-summary` uses the same Grok STT call as `audio-to-text`, then
 `POST https://api.x.ai/v1/chat/completions` with
 `grok-4.20-0309-non-reasoning` (override with `--model` or
@@ -113,6 +139,7 @@ dates are `—`. Empty decisions or action items are `None recorded.`
 
 ```
 File Interview.mp4 has been successfully transcribed and summarized
+File Call.m4a (+1 joined) has been successfully transcribed and summarized
 File clip.m4a has been successfully transcribed
 File notes.txt has been successfully summarized
 Could not transcribe and summarize Interview.mp4: STT request failed (HTTP 500)
