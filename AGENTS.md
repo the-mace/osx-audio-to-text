@@ -1,4 +1,27 @@
-# Agent instructions
+# Agent instructions: osx-audio-to-text
+
+Shared rules (pull before work, tests and lint, secrets, commit attribution)
+live in the global `~/.config/agents/AGENTS.md`. If that file is not loaded
+(cloud or CI sessions), the short version is: `git pull --ff-only` first, run
+the tests below before committing, never commit secrets, and end agent commits
+with a `Co-Authored-By: <Tool> (<model>) <email>` trailer.
+
+## Which coding agent
+
+Use Grok Build by default. This repo is xAI only (Grok STT and chat). Use Claude
+Code with Opus 5.5 for multi-file refactors of the CLIs and installer, or for
+security-sensitive changes. Either tool can be the other's second opinion.
+
+## Commands
+
+```bash
+make install       # CLI + Finder Quick Action
+make install-dev   # pytest / flake8
+make test
+make lint
+```
+
+## Rules
 
 This is a small macOS utility. Keep the surface area small: two CLIs, one
 Finder Quick Action, xAI only.
