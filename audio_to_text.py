@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -44,6 +44,9 @@ VOICED_BELOW_SPEECH_DB = 12.0
 VOICED_BRIDGE_SECONDS = 0.5
 MISSING_SPEECH_MIN_SECONDS = 2.0
 MISSING_SPEECH_MERGE_SECONDS = 2.0
+RECOVERY_PAD_SECONDS = 1.0
+DEDUPE_PAD_SECONDS = 0.1
+RECOVERED_SPEAKER = "?"
 
 SUPPORTED_EXTENSIONS = {
     ".wav",
@@ -835,32 +838,218 @@ def missing_speech_note(spans: Sequence[Span]) -> str:
     )
 
 
-def check_missing_speech(
-    source: Path, payload: dict[str, Any], *, multichannel: bool = False
-) -> list[Span]:
-    """Compare STT word timings with the audio and report untranscribed speech."""
+def recovered_speech_note(spans: Sequence[Span]) -> str:
+    if not spans:
+        return ""
+    return (
+        f"Note: Grok STT first skipped speech at {format_spans(spans)}. Those "
+        "parts were re-sent on their own and filled in; their speaker is "
+        "labeled Speaker ?."
+    )
+
+
+def cut_clip(source: Path, start: float, end: float) -> Path | None:
+    """16 kHz mono WAV of ``source`` from ``start`` to ``end`` seconds."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    fd, raw = tempfile.mkstemp(prefix="audio_to_text_clip_", suffix=".wav")
+    os.close(fd)
+    dest = Path(raw)
+    try:
+        completed = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                f"{start:.2f}",
+                "-to",
+                f"{end:.2f}",
+                "-i",
+                str(source),
+                "-map",
+                "0:a:0",
+                "-ac",
+                "1",
+                "-ar",
+                str(STT_SAMPLE_RATE),
+                "-c:a",
+                "pcm_s16le",
+                str(dest),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_for(source),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        dest.unlink(missing_ok=True)
+        log(f"clip failed file={source.name} error={exc}")
+        return None
+    if completed.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+        err = (completed.stderr or "").strip().replace("\n", " ")[:200]
+        dest.unlink(missing_ok=True)
+        log(f"clip ffmpeg failed file={source.name} {err}")
+        return None
+    return dest
+
+
+def _covers(spans: Sequence[Span], moment: float) -> bool:
+    return any(start <= moment <= end for start, end in spans)
+
+
+def retranscribe_spans(
+    source: Path,
+    spans: Sequence[Span],
+    words: Sequence[Any],
+    api_key: str,
+    *,
+    language: str = DEFAULT_LANGUAGE,
+    diarize: bool = True,
+    format_text: bool = True,
+    session: requests.Session | None = None,
+) -> tuple[list[dict[str, Any]], list[Span]]:
+    """Send each span to STT on its own; return new words and the spans that gave any.
+
+    Grok STT often transcribes a passage alone that it dropped from the whole
+    recording. Clip words that land on existing words are discarded, so the
+    padding around each span does not duplicate speech. Stretched filler
+    words do not count, since they sit on top of the dropped passage.
+    """
+    covered: list[Span] = []
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+        start = _as_time(word.get("start"))
+        end = _as_time(word.get("end"))
+        if start is None or end is None or not 0 <= end - start <= MAX_WORD_SECONDS:
+            continue
+        covered.append((start - DEDUPE_PAD_SECONDS, end + DEDUPE_PAD_SECONDS))
+    found_words: list[dict[str, Any]] = []
+    found_spans: list[Span] = []
+    for start, end in spans:
+        offset = max(0.0, start - RECOVERY_PAD_SECONDS)
+        clip = cut_clip(source, offset, end + RECOVERY_PAD_SECONDS)
+        if clip is None:
+            continue
+        try:
+            payload = request_transcription(
+                clip,
+                api_key,
+                language=language,
+                diarize=diarize,
+                format_text=format_text,
+                prepare=False,
+                session=session,
+            )
+        except AudioToTextError as exc:
+            log(f"retry failed file={source.name} span={format_spans([(start, end)])} {exc}")
+            continue
+        finally:
+            clip.unlink(missing_ok=True)
+        clip_words = payload.get("words")
+        added: list[dict[str, Any]] = []
+        for word in clip_words if isinstance(clip_words, list) else []:
+            if not isinstance(word, dict):
+                continue
+            token = word.get("text")
+            word_start = _as_time(word.get("start"))
+            word_end = _as_time(word.get("end"))
+            if not isinstance(token, str) or not token or word_start is None or word_end is None:
+                continue
+            word_start += offset
+            word_end += offset
+            if _covers(covered, (word_start + word_end) / 2):
+                continue
+            shifted = {**word, "start": word_start, "end": word_end}
+            if diarize:
+                # Clip speaker numbers are independent of the main pass.
+                shifted["speaker"] = RECOVERED_SPEAKER
+            added.append(shifted)
+        if added:
+            found_words.extend(added)
+            found_spans.append((start, end))
+    return found_words, found_spans
+
+
+def recover_missing_speech(
+    source: Path,
+    payload: dict[str, Any],
+    api_key: str,
+    *,
+    language: str = DEFAULT_LANGUAGE,
+    diarize: bool = True,
+    format_text: bool = True,
+    multichannel: bool = False,
+    session: requests.Session | None = None,
+) -> tuple[dict[str, Any], list[Span], list[Span]]:
+    """Find speech STT skipped, re-send those stretches, and merge the words in.
+
+    Returns the payload (merged when anything came back), the spans still
+    missing, and the spans that were filled in.
+    """
     words = payload.get("words")
     if multichannel or not isinstance(words, list) or not _word_spans(words):
-        return []
+        return payload, [], []
     levels = speech_levels(source)
     if not levels:
-        return []
-    spans = find_missing_speech(words, levels)
-    if spans:
-        log(f"possible missing speech file={source.name} at={format_spans(spans)}")
-        print(missing_speech_note(spans), file=sys.stderr)
-    return spans
+        return payload, [], []
+    missing = find_missing_speech(words, levels)
+    if not missing:
+        return payload, [], []
+    log(f"possible missing speech file={source.name} at={format_spans(missing)}; retrying")
+    recovered: list[Span] = []
+    text = payload.get("text") if isinstance(payload.get("text"), str) else ""
+    # The merged text is rebuilt from words, which would lose anything only
+    # the text field had.
+    if not words_incomplete(join_word_texts(words), text):
+        extra, recovered = retranscribe_spans(
+            source,
+            missing,
+            words,
+            api_key,
+            language=language,
+            diarize=diarize,
+            format_text=format_text,
+            session=session,
+        )
+        if extra:
+            merged = sorted(
+                [word for word in words if isinstance(word, dict)] + extra,
+                key=lambda word: _as_time(word.get("start")) or 0.0,
+            )
+            payload = {**payload, "words": merged, "text": join_word_texts(merged)}
+            missing = find_missing_speech(merged, levels)
+            log(
+                f"recovered speech file={source.name} at={format_spans(recovered)} "
+                f"words={len(extra)}"
+            )
+    if missing:
+        log(f"still missing speech file={source.name} at={format_spans(missing)}")
+        print(missing_speech_note(missing), file=sys.stderr)
+    return payload, missing, recovered
 
 
 @dataclass
 class Transcript:
     text: str
     missing_speech: list[Span]
+    recovered_speech: list[Span] = field(default_factory=list)
 
     def with_note(self) -> str:
-        """Transcript text headed by the missing-speech note, if any."""
-        note = missing_speech_note(self.missing_speech)
-        return f"{note}\n\n{self.text}" if note else self.text
+        """Transcript text headed by the recovered/missing-speech notes, if any."""
+        notes = [
+            note
+            for note in (
+                recovered_speech_note(self.recovered_speech),
+                missing_speech_note(self.missing_speech),
+            )
+            if note
+        ]
+        return "\n".join([*notes, "", self.text]) if notes else self.text
 
 
 def request_transcription(
@@ -983,8 +1172,8 @@ def fetch_transcription(
     prepare: bool = True,
     multichannel: bool = False,
     extra_parts: Sequence[Path] = (),
-) -> tuple[dict[str, Any], list[Span]]:
-    """Return the raw STT payload and any spans of speech it left out."""
+) -> tuple[dict[str, Any], list[Span], list[Span]]:
+    """Return the STT payload, spans still missing speech, and spans filled in."""
     with stt_source(path, extra_parts, multichannel=multichannel) as source:
         payload = request_transcription(
             source,
@@ -997,8 +1186,17 @@ def fetch_transcription(
             multichannel=multichannel,
             session=session,
         )
-        missing = check_missing_speech(source, payload, multichannel=multichannel)
-    return payload, missing
+        payload, missing, recovered = recover_missing_speech(
+            source,
+            payload,
+            api_key,
+            language=language,
+            diarize=diarize,
+            format_text=format_text,
+            multichannel=multichannel,
+            session=session,
+        )
+    return payload, missing, recovered
 
 
 def transcribe(
@@ -1017,7 +1215,7 @@ def transcribe(
     prefer_complete: bool = True,
     extra_parts: Sequence[Path] = (),
 ) -> Transcript:
-    payload, missing = fetch_transcription(
+    payload, missing, recovered = fetch_transcription(
         path,
         api_key,
         language=language,
@@ -1036,7 +1234,7 @@ def transcribe(
         min_turn_words=min_turn_words,
         prefer_complete=prefer_complete,
     )
-    return Transcript(text=text, missing_speech=missing)
+    return Transcript(text=text, missing_speech=missing, recovered_speech=recovered)
 
 
 def transcribe_file(
@@ -1219,7 +1417,7 @@ def process_file(
         source = " + ".join(str(part) for part in (path, *extra_parts))
         print(f"Would transcribe {source} -> {dest}")
         return dest
-    payload, missing = fetch_transcription(
+    payload, missing, recovered = fetch_transcription(
         path,
         api_key,
         language=language,
@@ -1240,7 +1438,7 @@ def process_file(
         min_turn_words=min_turn_words,
         prefer_complete=prefer_complete,
     )
-    written = write_transcript(path, Transcript(text, missing).with_note())
+    written = write_transcript(path, Transcript(text, missing, recovered).with_note())
     if do_notify:
         emit_notification(
             status_message(path, joined=len(extra_parts), missing_speech=missing)

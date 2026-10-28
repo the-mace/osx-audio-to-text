@@ -193,12 +193,16 @@ Grok STT sometimes drops a whole passage from a quieter speaker and returns
 everything else, so the transcript reads as complete when it is not. After
 each run, both CLIs compare the STT word timings with the audio's speech-band
 loudness (ffmpeg, 100 ms frames). Two seconds or more of audio within 12 dB of
-the transcribed speech, with no words, is reported as possible missing
-speech. The report is a `Note:` line at the top of the transcript, a quote
-under the `summary.md` title, the Finder notification, and stderr. The
-summary model never sees the note. The check is skipped with
-`--multichannel` or when ffmpeg is missing. It can also fire on loud
-background noise.
+the transcribed speech, with no words, counts as skipped speech. Each skipped
+stretch (plus 1 s either side) is sent to STT again on its own, which usually
+recovers it, and the new words are merged in by time. Recovered lines are
+labeled `Speaker ?`, since speaker numbers from a separate request do not
+match, and a `Note:` line at the top of the transcript lists the stretches.
+Whatever is still missing after the retry is reported as possible missing
+speech: in the transcript note, a quote under the `summary.md` title, the
+Finder notification, and stderr. The summary model never sees the notes. The
+check is skipped with `--multichannel` or when ffmpeg is missing. Loud
+background noise can also trigger it.
 
 Supported extensions: `.mp4`, `.m4a`, `.mp3`, `.wav`, `.aac`, `.flac`,
 `.ogg`, `.opus`, `.mkv`, `.qta`. Max 500 MB per file (Grok STT limit).

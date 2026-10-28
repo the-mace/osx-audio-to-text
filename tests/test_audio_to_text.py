@@ -1153,7 +1153,7 @@ def test_transcribe_file_notes_missing_speech(
     assert "possible missing speech at 0:03–0:08" in capsys.readouterr().err
 
 
-def test_check_missing_speech_skips_multichannel(
+def test_recover_missing_speech_skips_multichannel(
     audio_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def fail(path):
@@ -1161,7 +1161,62 @@ def test_check_missing_speech_skips_multichannel(
 
     monkeypatch.setattr(audio_to_text, "speech_levels", fail)
     payload = {"words": [_word("Hi", 0.0, 1.0)]}
-    assert audio_to_text.check_missing_speech(audio_file, payload, multichannel=True) == []
+    assert audio_to_text.recover_missing_speech(
+        audio_file, payload, "key", multichannel=True
+    ) == (payload, [], [])
+
+
+def test_transcribe_file_fills_in_skipped_speech(
+    audio_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: Grok STT dropped a quieter speaker's passage from the whole
+    # file but transcribed it when sent that stretch alone.
+    levels = _levels(12, {(0, 2): -25, (3, 8): -30, (10, 11): -25})
+    monkeypatch.setattr(audio_to_text, "speech_levels", lambda path: levels)
+    clips: list[tuple[float, float]] = []
+
+    def fake_cut(source, start, end):
+        clips.append((start, end))
+        clip = tmp_path / "clip.wav"
+        clip.write_bytes(b"RIFFclip")
+        return clip
+
+    monkeypatch.setattr(audio_to_text, "cut_clip", fake_cut)
+    session = MagicMock()
+    session.post.side_effect = [
+        _FakeResponse(
+            200,
+            {
+                "text": "Hello there. Bye.",
+                "words": [
+                    _word("Hello", 0.0, 1.0),
+                    _word("there.", 1.0, 2.0),
+                    _word("Bye.", 10.0, 11.0),
+                ],
+            },
+        ),
+        _FakeResponse(
+            200,
+            {
+                "text": "there. I dropped this.",
+                "words": [
+                    _word("there.", 0.0, 0.2, speaker=3),
+                    _word("I", 1.0, 1.3, speaker=3),
+                    _word("dropped", 1.5, 2.5, speaker=3),
+                    _word("this.", 3.0, 4.0, speaker=3),
+                ],
+            },
+        ),
+    ]
+    text = audio_to_text.transcribe_file(audio_file, "key", session=session)
+    assert clips == [(2.0, 9.0)]
+    assert text == (
+        "Note: Grok STT first skipped speech at 0:03–0:08. Those parts were "
+        "re-sent on their own and filled in; their speaker is labeled Speaker ?.\n"
+        "\n"
+        "Speaker 0: Hello there.\n\nSpeaker ?: I dropped this.\n\nSpeaker 0: Bye."
+    )
+    assert not (tmp_path / "clip.wav").exists()
 
 
 def test_status_message_warns_about_missing_speech(tmp_path: Path) -> None:
