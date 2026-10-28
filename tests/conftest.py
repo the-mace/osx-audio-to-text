@@ -30,3 +30,9 @@ def env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / ".env"
     monkeypatch.setattr(audio_to_text, "ENV_FILE_PATH", path)
     return path
+
+
+@pytest.fixture(autouse=True)
+def disable_speech_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ffmpeg loudness probe unless a test supplies its own speech_levels."""
+    monkeypatch.setattr(audio_to_text, "speech_levels", lambda path: None)

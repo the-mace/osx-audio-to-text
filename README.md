@@ -189,6 +189,17 @@ unlabeled `text` field (`--prefer-complete`, the default). `audio-to-text`
 does not run a second LLM pass; `meeting-summary` does (Grok chat).
 `--no-format` is CLI-only; the Finder action still sends `format=true`.
 
+Grok STT sometimes drops a whole passage from a quieter speaker and returns
+everything else, so the transcript reads as complete when it is not. After
+each run, both CLIs compare the STT word timings with the audio's speech-band
+loudness (ffmpeg, 100 ms frames). Two seconds or more of audio within 12 dB of
+the transcribed speech, with no words, is reported as possible missing
+speech. The report is a `Note:` line at the top of the transcript, a quote
+under the `summary.md` title, the Finder notification, and stderr. The
+summary model never sees the note. The check is skipped with
+`--multichannel` or when ffmpeg is missing. It can also fire on loud
+background noise.
+
 Supported extensions: `.mp4`, `.m4a`, `.mp3`, `.wav`, `.aac`, `.flac`,
 `.ogg`, `.opus`, `.mkv`, `.qta`. Max 500 MB per file (Grok STT limit).
 `.qta` is remuxed to `.m4a` first (`ffmpeg -map 0:a:0 -c:a copy`), then

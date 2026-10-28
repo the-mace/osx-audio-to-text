@@ -1063,3 +1063,112 @@ def test_main_without_join_keeps_one_txt_per_file(
     assert rc == 0
     assert (tmp_path / "Call.txt").is_file()
     assert (tmp_path / "Call 2.txt").is_file()
+
+
+def _levels(seconds: float, loud: dict[tuple[float, float], float]) -> list[tuple[float, float]]:
+    frames = []
+    for i in range(int(seconds * 10)):
+        stamp = round(i * 0.1, 1)
+        level = -60.0
+        for (start, end), db in loud.items():
+            if start <= stamp < end:
+                level = db
+        frames.append((stamp, level))
+    return frames
+
+
+def _word(text: str, start: float, end: float, speaker: int = 0) -> dict:
+    return {"text": text, "speaker": speaker, "start": start, "end": end}
+
+
+def test_parse_speech_levels_reads_frames_and_silence() -> None:
+    output = (
+        "frame:0    pts:0       pts_time:0\n"
+        "lavfi.astats.Overall.RMS_level=-26.5\n"
+        "frame:1    pts:1600    pts_time:0.1\n"
+        "lavfi.astats.Overall.RMS_level=-inf\n"
+    )
+    assert audio_to_text.parse_speech_levels(output) == [
+        (0.0, -26.5),
+        (0.1, audio_to_text.SILENCE_DB),
+    ]
+
+
+def test_find_missing_speech_flags_untranscribed_talking() -> None:
+    words = [_word("Hello", 0.0, 1.0), _word("there.", 1.0, 2.0), _word("Bye.", 10.0, 11.0)]
+    levels = _levels(12, {(0, 2): -25, (3, 8): -30, (10, 11): -25})
+    spans = audio_to_text.find_missing_speech(words, levels)
+    assert len(spans) == 1
+    assert spans[0][0] == pytest.approx(3.0)
+    assert spans[0][1] == pytest.approx(8.0)
+
+
+def test_find_missing_speech_ignores_quiet_pauses_and_short_blips() -> None:
+    words = [_word("Hello", 0.0, 1.0), _word("Bye.", 10.0, 11.0)]
+    levels = _levels(12, {(0, 1): -25, (5, 6): -28, (10, 11): -25})
+    assert audio_to_text.find_missing_speech(words, levels) == []
+
+
+def test_find_missing_speech_sees_through_stretched_word() -> None:
+    # Regression: STT returned "Yes." spanning 7.5-12.6 s over a dropped passage.
+    words = [_word("Good,", 2.6, 2.8), _word("Yes.", 7.5, 12.6), _word("Bye.", 14.0, 14.5)]
+    levels = _levels(15, {(2.6, 2.8): -25, (3.5, 12.6): -30, (14.0, 14.5): -25})
+    spans = audio_to_text.find_missing_speech(words, levels)
+    assert len(spans) == 1
+    assert spans[0][0] == pytest.approx(3.5)
+    assert spans[0][1] == pytest.approx(10.85, abs=0.1)
+
+
+def test_find_missing_speech_needs_timed_words() -> None:
+    levels = _levels(5, {(0, 5): -25})
+    assert audio_to_text.find_missing_speech([{"text": "Hi"}], levels) == []
+
+
+def test_format_spans_uses_clock_times() -> None:
+    assert audio_to_text.format_spans([(3.0, 18.2), (3700.0, 3725.0)]) == (
+        "0:03–0:19, 1:01:40–1:02:05"
+    )
+
+
+def test_transcribe_file_notes_missing_speech(
+    audio_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    levels = _levels(12, {(0, 2): -25, (3, 8): -30, (10, 11): -25})
+    monkeypatch.setattr(audio_to_text, "speech_levels", lambda path: levels)
+    session = MagicMock()
+    session.post.return_value = _FakeResponse(
+        200,
+        {
+            "text": "Hello there. Bye.",
+            "words": [
+                _word("Hello", 0.0, 1.0),
+                _word("there.", 1.0, 2.0),
+                _word("Bye.", 10.0, 11.0),
+            ],
+        },
+    )
+    text = audio_to_text.transcribe_file(audio_file, "key", session=session)
+    assert text.startswith("Note: possible missing speech at 0:03–0:08.")
+    assert text.endswith("Speaker 0: Hello there. Bye.")
+    assert "possible missing speech at 0:03–0:08" in capsys.readouterr().err
+
+
+def test_check_missing_speech_skips_multichannel(
+    audio_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(path):
+        raise AssertionError("should not probe levels")
+
+    monkeypatch.setattr(audio_to_text, "speech_levels", fail)
+    payload = {"words": [_word("Hi", 0.0, 1.0)]}
+    assert audio_to_text.check_missing_speech(audio_file, payload, multichannel=True) == []
+
+
+def test_status_message_warns_about_missing_speech(tmp_path: Path) -> None:
+    msg = audio_to_text.status_message(
+        tmp_path / "call.m4a", summarized=True, missing_speech=[(0.0, 18.4)]
+    )
+    assert msg == (
+        "File call.m4a has been successfully transcribed and summarized, "
+        "but may be missing speech at 0:00–0:19"
+    )

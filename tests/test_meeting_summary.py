@@ -284,3 +284,55 @@ def test_main_join_writes_one_summary_for_all_parts(
 def test_join_rejects_from_transcript(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         meeting_summary.parse_args(["--join", "--from-transcript", "a.txt", "b.txt"])
+
+
+def test_add_missing_speech_note_goes_under_title() -> None:
+    markdown = "# Call\n\n- **Date:** Unknown"
+    noted = meeting_summary.add_missing_speech_note(markdown, [(0.0, 18.4)])
+    assert noted.splitlines()[:3] == [
+        "# Call",
+        "",
+        "> **Note: possible missing speech at 0:00–0:19. The audio sounds like "
+        "talking there but Grok STT returned no words. Listen to those parts.**",
+    ]
+    assert meeting_summary.add_missing_speech_note(markdown, []) == markdown
+
+
+def test_main_records_missing_speech(
+    audio_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "secret-key")
+    levels = [(round(i * 0.1, 1), -25.0 if i < 20 or 30 <= i < 80 else -60.0) for i in range(100)]
+    monkeypatch.setattr(audio_to_text, "speech_levels", lambda path: levels)
+    chat_bodies: list[dict] = []
+
+    def fake_post(url, **kwargs):
+        if url == audio_to_text.STT_URL:
+            return _FakeResponse(
+                200,
+                {
+                    "text": "Good, how are you?",
+                    "words": [
+                        {"text": "Good,", "speaker": 1, "start": 0.0, "end": 0.5},
+                        {"text": "how", "speaker": 1, "start": 0.5, "end": 1.0},
+                        {"text": "are", "speaker": 1, "start": 1.0, "end": 1.5},
+                        {"text": "you?", "speaker": 1, "start": 1.5, "end": 2.0},
+                    ],
+                },
+            )
+        if url == meeting_summary.CHAT_URL:
+            chat_bodies.append(kwargs["json"])
+            return _FakeResponse(200, _chat_payload("# Call\n\n- **Date:** Unknown\n"))
+        raise AssertionError(url)
+
+    with patch("audio_to_text.requests.post", side_effect=fake_post), patch(
+        "meeting_summary.requests.post", side_effect=fake_post
+    ):
+        rc = meeting_summary.main([str(audio_file)])
+    assert rc == 0
+    out = audio_file.parent / audio_file.stem
+    transcript = (out / "transcript.txt").read_text(encoding="utf-8")
+    assert transcript.startswith("Note: possible missing speech at 0:03–0:08.")
+    assert "Note:" not in chat_bodies[0]["messages"][1]["content"]
+    summary = (out / "summary.md").read_text(encoding="utf-8")
+    assert summary.splitlines()[2].startswith("> **Note: possible missing speech at 0:03–0:08.")

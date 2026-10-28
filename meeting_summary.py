@@ -168,6 +168,23 @@ def request_summary(
     return markdown
 
 
+def add_missing_speech_note(
+    markdown: str, spans: Sequence[audio_to_text.Span]
+) -> str:
+    """Put the missing-speech warning under the summary title.
+
+    Added here rather than asked of the model, so it always appears exactly once.
+    """
+    note = audio_to_text.missing_speech_note(spans)
+    if not note:
+        return markdown
+    quote = f"> **{note}**"
+    lines = markdown.splitlines()
+    if lines and lines[0].startswith("# "):
+        return "\n".join([lines[0], "", quote, *lines[1:]])
+    return f"{quote}\n\n{markdown}"
+
+
 def transcribe_recording(
     path: Path,
     api_key: str,
@@ -183,8 +200,8 @@ def transcribe_recording(
     prefer_complete: bool = True,
     session: requests.Session | None = None,
     extra_parts: Sequence[Path] = (),
-) -> str:
-    return audio_to_text.transcribe_file(
+) -> audio_to_text.Transcript:
+    return audio_to_text.transcribe(
         path,
         api_key,
         language=language,
@@ -244,8 +261,9 @@ def process_meeting(
             raise MeetingSummaryError(f"Could not read transcript {path}: {exc}") from exc
         if not transcript.strip():
             raise MeetingSummaryError(f"{path.name} is empty")
+        result = audio_to_text.Transcript(text=transcript, missing_speech=[])
     else:
-        transcript = transcribe_recording(
+        result = transcribe_recording(
             path,
             api_key,
             language=language,
@@ -260,14 +278,15 @@ def process_meeting(
             session=session,
             extra_parts=extra_parts,
         )
-    write_text(transcript_dest, transcript)
+    write_text(transcript_dest, result.with_note())
     markdown = request_summary(
-        transcript,
+        result.text,
         api_key,
         source_name=path.name,
         model=model,
         session=session,
     )
+    markdown = add_missing_speech_note(markdown, result.missing_speech)
     written = write_text(summary_dest, markdown)
     if do_notify:
         audio_to_text.emit_notification(
@@ -276,6 +295,7 @@ def process_meeting(
                 summarized=True,
                 from_transcript=from_transcript,
                 joined=len(extra_parts),
+                missing_speech=result.missing_speech,
             )
         )
     else:

@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,14 @@ ISOLATION_GAP_SECONDS = 0.8
 INCOMPLETE_WORD_RATIO = 0.85
 WORDS_INCOMPLETE_WARNING = "diarization words shorter than text; wrote complete text."
 FULL_TEXT_HEADING = "Full STT text (no speakers)"
+LEVEL_FRAME_SECONDS = 0.1
+SILENCE_DB = -120.0
+WORD_PAD_SECONDS = 0.25
+MAX_WORD_SECONDS = 1.5
+VOICED_BELOW_SPEECH_DB = 12.0
+VOICED_BRIDGE_SECONDS = 0.5
+MISSING_SPEECH_MIN_SECONDS = 2.0
+MISSING_SPEECH_MERGE_SECONDS = 2.0
 
 SUPPORTED_EXTENSIONS = {
     ".wav",
@@ -670,6 +680,189 @@ def format_transcript(
     return f"{labeled}\n\n---\n{FULL_TEXT_HEADING}\n\n{fallback_str}"
 
 
+Span = tuple[float, float]
+
+
+def parse_speech_levels(output: str) -> list[tuple[float, float]]:
+    """Parse ffmpeg ``ametadata=mode=print`` output into (seconds, RMS dB) frames."""
+    levels: list[tuple[float, float]] = []
+    stamp: float | None = None
+    for line in output.splitlines():
+        if line.startswith("frame:"):
+            match = re.search(r"pts_time:(\S+)", line)
+            stamp = float(match.group(1)) if match else None
+        elif line.startswith("lavfi.astats.Overall.RMS_level=") and stamp is not None:
+            try:
+                level = float(line.split("=", 1)[1])
+            except ValueError:
+                continue
+            if math.isnan(level):
+                continue
+            levels.append((stamp, max(level, SILENCE_DB)))
+            stamp = None
+    return levels
+
+
+def speech_levels(path: Path) -> list[tuple[float, float]] | None:
+    """Speech-band loudness per 100 ms frame, or None when ffmpeg cannot measure it."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    samples = int(STT_SAMPLE_RATE * LEVEL_FRAME_SECONDS)
+    chain = (
+        f"aresample={STT_SAMPLE_RATE},highpass=f=150,lowpass=f=4000,"
+        f"asetnsamples=n={samples}:p=0,astats=metadata=1:reset=1,"
+        "ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file=-"
+    )
+    try:
+        completed = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-nostats",
+                "-loglevel",
+                "error",
+                "-i",
+                str(path),
+                "-map",
+                "0:a:0",
+                "-af",
+                chain,
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_for(path),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"speech levels failed file={path.name} error={exc}")
+        return None
+    if completed.returncode != 0:
+        err = (completed.stderr or "").strip().replace("\n", " ")[:200]
+        log(f"speech levels ffmpeg failed file={path.name} {err}")
+        return None
+    return parse_speech_levels(completed.stdout or "")
+
+
+def _merge_spans(spans: Sequence[Span], gap: float) -> list[Span]:
+    merged: list[Span] = []
+    for start, end in sorted(spans):
+        if merged and start - merged[-1][1] <= gap:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _word_spans(words: Sequence[Any]) -> list[Span]:
+    spans: list[Span] = []
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+        start = _as_time(word.get("start"))
+        end = _as_time(word.get("end"))
+        if start is None or end is None or end < start:
+            continue
+        # STT stretches a filler word across a passage it dropped ("Yes."
+        # spanning 5 s of someone else talking), so it cannot vouch for all of it.
+        start = max(start, end - MAX_WORD_SECONDS)
+        spans.append((start - WORD_PAD_SECONDS, end + WORD_PAD_SECONDS))
+    return _merge_spans(spans, 0.0)
+
+
+def find_missing_speech(
+    words: Sequence[Any], levels: Sequence[tuple[float, float]]
+) -> list[Span]:
+    """Spans that sound like speech but have no STT words.
+
+    Grok STT sometimes drops a quieter speaker's whole passage yet returns
+    everything else, so the transcript reads as complete. "Sounds like
+    speech" means within 12 dB of the median level under transcribed words.
+    """
+    covered = _word_spans(words)
+    if not covered or not levels:
+        return []
+    inside: list[float] = []
+    outside: list[tuple[float, float]] = []
+    index = 0
+    for stamp, level in sorted(levels):
+        while index < len(covered) and covered[index][1] < stamp:
+            index += 1
+        if index < len(covered) and covered[index][0] <= stamp:
+            inside.append(level)
+        else:
+            outside.append((stamp, level))
+    if not inside:
+        return []
+    threshold = statistics.median(inside) - VOICED_BELOW_SPEECH_DB
+    voiced = [
+        (stamp, stamp + LEVEL_FRAME_SECONDS)
+        for stamp, level in outside
+        if level >= threshold
+    ]
+    passages = _merge_spans(voiced, VOICED_BRIDGE_SECONDS)
+    long_enough = [
+        span for span in passages if span[1] - span[0] >= MISSING_SPEECH_MIN_SECONDS
+    ]
+    return _merge_spans(long_enough, MISSING_SPEECH_MERGE_SECONDS)
+
+
+def format_clock(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def format_spans(spans: Sequence[Span]) -> str:
+    return ", ".join(
+        f"{format_clock(start)}–{format_clock(math.ceil(end))}" for start, end in spans
+    )
+
+
+def missing_speech_note(spans: Sequence[Span]) -> str:
+    if not spans:
+        return ""
+    return (
+        f"Note: possible missing speech at {format_spans(spans)}. The audio "
+        "sounds like talking there but Grok STT returned no words. Listen to "
+        "those parts."
+    )
+
+
+def check_missing_speech(
+    source: Path, payload: dict[str, Any], *, multichannel: bool = False
+) -> list[Span]:
+    """Compare STT word timings with the audio and report untranscribed speech."""
+    words = payload.get("words")
+    if multichannel or not isinstance(words, list) or not _word_spans(words):
+        return []
+    levels = speech_levels(source)
+    if not levels:
+        return []
+    spans = find_missing_speech(words, levels)
+    if spans:
+        log(f"possible missing speech file={source.name} at={format_spans(spans)}")
+        print(missing_speech_note(spans), file=sys.stderr)
+    return spans
+
+
+@dataclass
+class Transcript:
+    text: str
+    missing_speech: list[Span]
+
+    def with_note(self) -> str:
+        """Transcript text headed by the missing-speech note, if any."""
+        note = missing_speech_note(self.missing_speech)
+        return f"{note}\n\n{self.text}" if note else self.text
+
+
 def request_transcription(
     path: Path,
     api_key: str,
@@ -779,6 +972,73 @@ def request_transcription(
             unwrapped.unlink(missing_ok=True)
 
 
+def fetch_transcription(
+    path: Path,
+    api_key: str,
+    language: str = DEFAULT_LANGUAGE,
+    session: requests.Session | None = None,
+    *,
+    diarize: bool = True,
+    format_text: bool = True,
+    prepare: bool = True,
+    multichannel: bool = False,
+    extra_parts: Sequence[Path] = (),
+) -> tuple[dict[str, Any], list[Span]]:
+    """Return the raw STT payload and any spans of speech it left out."""
+    with stt_source(path, extra_parts, multichannel=multichannel) as source:
+        payload = request_transcription(
+            source,
+            api_key,
+            language=language,
+            diarize=diarize,
+            format_text=format_text,
+            # A joined file is already 16 kHz mono WAV.
+            prepare=prepare and not extra_parts,
+            multichannel=multichannel,
+            session=session,
+        )
+        missing = check_missing_speech(source, payload, multichannel=multichannel)
+    return payload, missing
+
+
+def transcribe(
+    path: Path,
+    api_key: str,
+    language: str = DEFAULT_LANGUAGE,
+    session: requests.Session | None = None,
+    *,
+    diarize: bool = True,
+    format_text: bool = True,
+    prepare: bool = True,
+    multichannel: bool = False,
+    merge_turns: bool = True,
+    min_turn_seconds: float = DEFAULT_MIN_TURN_SECONDS,
+    min_turn_words: int = DEFAULT_MIN_TURN_WORDS,
+    prefer_complete: bool = True,
+    extra_parts: Sequence[Path] = (),
+) -> Transcript:
+    payload, missing = fetch_transcription(
+        path,
+        api_key,
+        language=language,
+        session=session,
+        diarize=diarize,
+        format_text=format_text,
+        prepare=prepare,
+        multichannel=multichannel,
+        extra_parts=extra_parts,
+    )
+    text = format_transcript(
+        payload,
+        use_diarization=diarize,
+        merge_turns=merge_turns,
+        min_turn_seconds=min_turn_seconds,
+        min_turn_words=min_turn_words,
+        prefer_complete=prefer_complete,
+    )
+    return Transcript(text=text, missing_speech=missing)
+
+
 def transcribe_file(
     path: Path,
     api_key: str,
@@ -795,26 +1055,21 @@ def transcribe_file(
     prefer_complete: bool = True,
     extra_parts: Sequence[Path] = (),
 ) -> str:
-    with stt_source(path, extra_parts, multichannel=multichannel) as source:
-        payload = request_transcription(
-            source,
-            api_key,
-            language=language,
-            diarize=diarize,
-            format_text=format_text,
-            # A joined file is already 16 kHz mono WAV.
-            prepare=prepare and not extra_parts,
-            multichannel=multichannel,
-            session=session,
-        )
-    return format_transcript(
-        payload,
-        use_diarization=diarize,
+    return transcribe(
+        path,
+        api_key,
+        language=language,
+        session=session,
+        diarize=diarize,
+        format_text=format_text,
+        prepare=prepare,
+        multichannel=multichannel,
         merge_turns=merge_turns,
         min_turn_seconds=min_turn_seconds,
         min_turn_words=min_turn_words,
         prefer_complete=prefer_complete,
-    )
+        extra_parts=extra_parts,
+    ).with_note()
 
 
 def json_sidecar_path(source: Path, json_out: str | None) -> Path | None:
@@ -879,10 +1134,12 @@ def status_message(
     from_transcript: bool = False,
     error: BaseException | str | None = None,
     joined: int = 0,
+    missing_speech: Sequence[Span] = (),
 ) -> str:
     """One-line Finder/notification status. Filename only, never a full path.
 
     ``joined`` is how many further recordings were joined onto ``path``.
+    ``missing_speech`` spans are appended as a warning on success.
     """
     if from_transcript:
         done = "summarized"
@@ -898,9 +1155,12 @@ def status_message(
     if name and joined:
         name = f"{name} (+{joined} joined)"
     if error is None:
+        warning = ""
+        if missing_speech:
+            warning = f", but may be missing speech at {format_spans(missing_speech)}"
         if name:
-            return f"File {name} has been successfully {done}"
-        return f"File has been successfully {done}"
+            return f"File {name} has been successfully {done}{warning}"
+        return f"File has been successfully {done}{warning}"
 
     detail = str(error)
     if path is not None:
@@ -959,17 +1219,16 @@ def process_file(
         source = " + ".join(str(part) for part in (path, *extra_parts))
         print(f"Would transcribe {source} -> {dest}")
         return dest
-    with stt_source(path, extra_parts, multichannel=multichannel) as source:
-        payload = request_transcription(
-            source,
-            api_key,
-            language=language,
-            diarize=diarize,
-            format_text=format_text,
-            # A joined file is already 16 kHz mono WAV.
-            prepare=prepare and not extra_parts,
-            multichannel=multichannel,
-        )
+    payload, missing = fetch_transcription(
+        path,
+        api_key,
+        language=language,
+        diarize=diarize,
+        format_text=format_text,
+        prepare=prepare,
+        multichannel=multichannel,
+        extra_parts=extra_parts,
+    )
     sidecar = json_sidecar_path(path, json_out)
     if sidecar is not None:
         write_json(sidecar, payload)
@@ -981,9 +1240,11 @@ def process_file(
         min_turn_words=min_turn_words,
         prefer_complete=prefer_complete,
     )
-    written = write_transcript(path, text)
+    written = write_transcript(path, Transcript(text, missing).with_note())
     if do_notify:
-        emit_notification(status_message(path, joined=len(extra_parts)))
+        emit_notification(
+            status_message(path, joined=len(extra_parts), missing_speech=missing)
+        )
     else:
         print(written)
     return written
