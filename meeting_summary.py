@@ -14,8 +14,9 @@ import requests
 import audio_to_text
 
 CHAT_URL = "https://api.x.ai/v1/chat/completions"
-DEFAULT_MODEL = "grok-4.20-0309-non-reasoning"
-CHAT_TIMEOUT = 180
+DEFAULT_MODEL = "grok-4.7"
+# grok-4.7 always reasons: a 13k-word transcript took ~90s, so allow long meetings room.
+CHAT_TIMEOUT = 600
 TRANSCRIPT_NAME = "transcript.txt"
 SUMMARY_NAME = "summary.md"
 

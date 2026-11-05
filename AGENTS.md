@@ -45,8 +45,10 @@ Finder Quick Action, xAI only.
   ffmpeg concatenates them in natural filename order into one 16 kHz
   mono WAV and STT sees a single file. Output is named after the first
   part. Without `--join`, multiple inputs stay separate jobs.
-- Default summary model is `grok-4.20-0309-non-reasoning` (same family as
-  `osx-file-renamer`). Override with `--model` or `MEETING_SUMMARY_MODEL`.
+- Default summary model is `grok-4.7` (reasoning). It gave more complete,
+  more accurate summaries than `grok-4.20-0309-non-reasoning` on real
+  meetings, and speed does not matter for one call per meeting. Override
+  with `--model` or `MEETING_SUMMARY_MODEL`.
 - `audio-to-text` writes a sidecar `.txt` next to the recording.
   `meeting-summary` writes `<stem>/summary.md` (primary) and
   `<stem>/transcript.txt` (source). Do not make the sidecar the meeting
