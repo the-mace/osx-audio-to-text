@@ -9,6 +9,16 @@ import audio_to_text
 import meeting_summary
 
 
+class _FakeStream:
+    def __init__(self, lines: list[str]) -> None:
+        self.status_code = 200
+        self._lines = lines
+
+    def iter_lines(self):
+        for line in self._lines:
+            yield line.encode("utf-8")
+
+
 class _FakeResponse:
     def __init__(self, status_code: int, payload=None, text: str = "") -> None:
         self.status_code = status_code
@@ -21,8 +31,23 @@ class _FakeResponse:
         return self._payload
 
 
-def _chat_payload(content: str) -> dict:
-    return {"choices": [{"message": {"content": content}}]}
+def _sse(chunk: dict) -> str:
+    return f"data: {json.dumps(chunk)}"
+
+
+def _chat_response(content: str, usage: dict | None = None) -> _FakeStream:
+    half = len(content) // 2
+    lines = [
+        _sse({"choices": [{"delta": {"reasoning_content": "thinking", "role": "assistant"}}]}),
+        "",
+        _sse({"choices": [{"delta": {"content": content[:half]}}]}),
+        "",
+        _sse({"choices": [{"delta": {"content": content[half:]}}]}),
+        "",
+    ]
+    if usage is not None:
+        lines += [_sse({"choices": [], "usage": usage}), ""]
+    return _FakeStream([*lines, "data: [DONE]"])
 
 
 def test_default_output_dir(tmp_path: Path) -> None:
@@ -38,7 +63,7 @@ def test_strip_markdown_fence() -> None:
 
 def test_request_summary_posts_chat_completions() -> None:
     session = MagicMock()
-    session.post.return_value = _FakeResponse(200, _chat_payload("# Hello\n"))
+    session.post.return_value = _chat_response("# Hello\n")
     text = meeting_summary.request_summary(
         "Speaker 0: Hello.",
         "secret-key",
@@ -52,7 +77,8 @@ def test_request_summary_posts_chat_completions() -> None:
     assert kwargs["headers"]["Authorization"] == "Bearer secret-key"
     body = kwargs["json"]
     assert body["model"] == "grok-test"
-    assert body["stream"] is False
+    assert body["stream"] is True
+    assert kwargs["stream"] is True
     assert body["messages"][0]["role"] == "system"
     assert "clip.m4a" in body["messages"][1]["content"]
     assert "Speaker 0: Hello." in body["messages"][1]["content"]
@@ -75,6 +101,64 @@ def test_request_summary_401() -> None:
 def test_request_summary_network_error() -> None:
     session = MagicMock()
     session.post.side_effect = requests.ConnectionError("boom")
+    with pytest.raises(meeting_summary.MeetingSummaryError, match="network error"):
+        meeting_summary.request_summary(
+            "Hello", "key", source_name="clip.m4a", session=session
+        )
+
+
+def test_request_summary_ignores_reasoning_and_logs_usage() -> None:
+    session = MagicMock()
+    session.post.return_value = _chat_response(
+        "# Title\n\n- **Date:** Unknown — 5 €\n",
+        usage={
+            "prompt_tokens": 1258,
+            "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": 1152},
+            "completion_tokens_details": {"reasoning_tokens": 521},
+        },
+    )
+    with patch("audio_to_text.log") as log:
+        text = meeting_summary.request_summary(
+            "Hello", "key", source_name="clip.m4a", session=session
+        )
+    assert text == "# Title\n\n- **Date:** Unknown — 5 €"
+    assert "thinking" not in text
+    line = log.call_args.args[0]
+    assert "cached_tokens=1152" in line
+    assert "reasoning_tokens=521" in line
+
+
+def test_request_summary_stream_error_chunk() -> None:
+    session = MagicMock()
+    session.post.return_value = _FakeStream(
+        [_sse({"error": "overloaded"}), "data: [DONE]"]
+    )
+    with pytest.raises(meeting_summary.MeetingSummaryError, match="overloaded"):
+        meeting_summary.request_summary(
+            "Hello", "key", source_name="clip.m4a", session=session
+        )
+
+
+def test_request_summary_stream_with_no_content_is_empty() -> None:
+    session = MagicMock()
+    session.post.return_value = _FakeStream(
+        [_sse({"choices": [{"delta": {"reasoning_content": "hmm"}}]}), "data: [DONE]"]
+    )
+    with pytest.raises(meeting_summary.MeetingSummaryError, match="content is empty"):
+        meeting_summary.request_summary(
+            "Hello", "key", source_name="clip.m4a", session=session
+        )
+
+
+def test_request_summary_stream_read_timeout() -> None:
+    class _Dropped(_FakeStream):
+        def iter_lines(self):
+            yield _sse({"choices": [{"delta": {"content": "# Par"}}]}).encode()
+            raise requests.exceptions.ConnectionError("read timed out")
+
+    session = MagicMock()
+    session.post.return_value = _Dropped([])
     with pytest.raises(meeting_summary.MeetingSummaryError, match="network error"):
         meeting_summary.request_summary(
             "Hello", "key", source_name="clip.m4a", session=session
@@ -122,7 +206,7 @@ def test_main_writes_folder(
                 },
             )
         if url == meeting_summary.CHAT_URL:
-            return _FakeResponse(200, _chat_payload("# Ship plan\n\n## Decisions\n- Ship Friday."))
+            return _chat_response("# Ship plan\n\n## Decisions\n- Ship Friday.")
         raise AssertionError(url)
 
     with patch("audio_to_text.requests.post", side_effect=fake_post), patch(
@@ -149,7 +233,7 @@ def test_main_out_and_from_transcript(
     source.write_text("Speaker 0: Done.\n", encoding="utf-8")
     out = tmp_path / "meeting-out"
     session = MagicMock()
-    session.post.return_value = _FakeResponse(200, _chat_payload("# Notes\n"))
+    session.post.return_value = _chat_response("# Notes\n")
     with patch("meeting_summary.requests.post", session.post):
         rc = meeting_summary.main(
             ["--from-transcript", "--out", str(out), str(source)]
@@ -178,7 +262,7 @@ def test_main_notify_prints_status_not_path(
         if url == audio_to_text.STT_URL:
             return _FakeResponse(200, {"text": "We will ship Friday."})
         if url == meeting_summary.CHAT_URL:
-            return _FakeResponse(200, _chat_payload("# Ship plan\n"))
+            return _chat_response("# Ship plan\n")
         raise AssertionError(url)
 
     expected = "File clip.mp4 has been successfully transcribed and summarized"
@@ -219,7 +303,7 @@ def test_main_notify_from_transcript_says_summarized(
     source = tmp_path / "notes.txt"
     source.write_text("Speaker 0: Done.\n", encoding="utf-8")
     session = MagicMock()
-    session.post.return_value = _FakeResponse(200, _chat_payload("# Notes\n"))
+    session.post.return_value = _chat_response("# Notes\n")
     expected = "File notes.txt has been successfully summarized"
     with patch("meeting_summary.requests.post", session.post), patch(
         "audio_to_text.notify"
@@ -257,7 +341,7 @@ def test_main_join_writes_one_summary_for_all_parts(
             stt_uploads.append(kwargs["files"]["file"][0])
             return _FakeResponse(200, {"text": "First half. Second half."})
         if url == meeting_summary.CHAT_URL:
-            return _FakeResponse(200, _chat_payload("# Whole call\n"))
+            return _chat_response("# Whole call\n")
         raise AssertionError(url)
 
     monkeypatch.setattr(audio_to_text, "join_recordings", fake_join)
@@ -322,7 +406,7 @@ def test_main_records_missing_speech(
             )
         if url == meeting_summary.CHAT_URL:
             chat_bodies.append(kwargs["json"])
-            return _FakeResponse(200, _chat_payload("# Call\n\n- **Date:** Unknown\n"))
+            return _chat_response("# Call\n\n- **Date:** Unknown\n")
         raise AssertionError(url)
 
     with patch("audio_to_text.requests.post", side_effect=fake_post), patch(

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -15,8 +16,9 @@ import audio_to_text
 
 CHAT_URL = "https://api.x.ai/v1/chat/completions"
 DEFAULT_MODEL = "grok-4.7"
-# grok-4.7 always reasons: a 13k-word transcript took ~90s, so allow long meetings room.
-CHAT_TIMEOUT = 600
+# Read timeout between stream chunks, not for the whole call. grok-4.7 streams its
+# reasoning every few seconds, so a long meeting can reason for many minutes.
+CHAT_TIMEOUT = 300
 TRANSCRIPT_NAME = "transcript.txt"
 SUMMARY_NAME = "summary.md"
 
@@ -108,7 +110,10 @@ def request_summary(
     chosen = model or summary_model()
     payload: dict[str, Any] = {
         "model": chosen,
-        "stream": False,
+        # Non-streaming sends nothing until reasoning ends, so a 1-hour meeting sat
+        # silent for ~5 minutes against the read timeout.
+        "stream": True,
+        "stream_options": {"include_usage": True},
         "messages": [
             {"role": "system", "content": SUMMARY_SYSTEM},
             {
@@ -129,6 +134,7 @@ def request_summary(
                 "Content-Type": "application/json",
             },
             json=payload,
+            stream=True,
             timeout=CHAT_TIMEOUT,
         )
     except requests.RequestException as exc:
@@ -142,31 +148,60 @@ def request_summary(
             f"{source_name}: summary request failed "
             f"(HTTP {response.status_code}){detail}"
         )
-    try:
-        body = response.json()
-    except ValueError as exc:
-        raise MeetingSummaryError(f"{source_name}: summary returned non-JSON") from exc
-    if not isinstance(body, dict):
-        raise MeetingSummaryError(f"{source_name}: summary returned non-object JSON")
-    choices = body.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise MeetingSummaryError(f"{source_name}: summary response missing choices")
-    first = choices[0]
-    if not isinstance(first, dict):
-        raise MeetingSummaryError(f"{source_name}: summary choice is not an object")
-    message = first.get("message")
-    if not isinstance(message, dict):
-        raise MeetingSummaryError(f"{source_name}: summary message is missing")
-    content = message.get("content")
-    if not isinstance(content, str) or not content.strip():
+    content, usage = _read_stream(response, source_name)
+    if not content.strip():
         raise MeetingSummaryError(f"{source_name}: summary content is empty")
     markdown = strip_markdown_fence(content)
     if not markdown:
         raise MeetingSummaryError(f"{source_name}: summary content is empty")
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    completion_details = usage.get("completion_tokens_details") or {}
     audio_to_text.log(
-        f"summarized source={source_name} model={chosen} chars={len(markdown)}"
+        f"summarized source={source_name} model={chosen} chars={len(markdown)} "
+        f"prompt_tokens={usage.get('prompt_tokens')} "
+        f"cached_tokens={prompt_details.get('cached_tokens')} "
+        f"reasoning_tokens={completion_details.get('reasoning_tokens')} "
+        f"completion_tokens={usage.get('completion_tokens')}"
     )
     return markdown
+
+
+def _read_stream(response: Any, source_name: str) -> tuple[str, dict[str, Any]]:
+    """Join the content deltas of an SSE chat stream; return (content, usage)."""
+    parts: list[str] = []
+    usage: dict[str, Any] = {}
+    try:
+        for raw in response.iter_lines():
+            line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError as exc:
+                raise MeetingSummaryError(
+                    f"{source_name}: summary stream returned non-JSON"
+                ) from exc
+            if not isinstance(chunk, dict):
+                raise MeetingSummaryError(
+                    f"{source_name}: summary stream returned non-object JSON"
+                )
+            if chunk.get("error"):
+                raise MeetingSummaryError(
+                    f"{source_name}: summary stream error: {chunk['error']}"
+                )
+            if isinstance(chunk.get("usage"), dict):
+                usage = chunk["usage"]
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") if isinstance(choice, dict) else None
+                text = delta.get("content") if isinstance(delta, dict) else None
+                if isinstance(text, str):
+                    parts.append(text)
+    except requests.RequestException as exc:
+        raise MeetingSummaryError(f"{source_name}: summary network error: {exc}") from exc
+    return "".join(parts), usage
 
 
 def add_missing_speech_note(

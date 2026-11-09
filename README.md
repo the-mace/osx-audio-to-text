@@ -124,7 +124,9 @@ run it once per recording rather than on a batch of unrelated files.
 `meeting-summary` uses the same Grok STT call as `audio-to-text`, then
 `POST https://api.x.ai/v1/chat/completions` with `grok-4.7` (override
 with `--model` or `MEETING_SUMMARY_MODEL`). It is a reasoning model, so a
-summary takes about 45–90 seconds. The transcript is a source file in the
+summary takes about 1–5 minutes (about 5 for a one-hour meeting). The
+response is streamed, so a long reasoning phase does not hit the request
+timeout. The transcript is a source file in the
 output folder, not a sidecar next to the recording.
 
 `summary.md` is GitHub-flavored markdown with a short title, date,
