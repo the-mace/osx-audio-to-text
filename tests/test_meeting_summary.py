@@ -84,6 +84,14 @@ def test_request_summary_posts_chat_completions() -> None:
     assert "Speaker 0: Hello." in body["messages"][1]["content"]
 
 
+# A real call summary turned an advisor's "stay with your current firm" advice
+# into a neutral fact, which read as the opposite recommendation.
+def test_summary_prompt_requires_attributed_advice() -> None:
+    prompt = meeting_summary.SUMMARY_SYSTEM
+    assert "lead Key points with it" in prompt
+    assert "attributed to them as advice" in prompt
+
+
 def test_request_summary_rejects_empty() -> None:
     with pytest.raises(meeting_summary.MeetingSummaryError, match="empty"):
         meeting_summary.request_summary("   ", "key", source_name="clip.m4a")

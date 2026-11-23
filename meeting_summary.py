@@ -52,6 +52,11 @@ Rules:
 - If no due date is stated, put Due as —.
 - If there are no action items, write "None recorded." under the heading
   instead of an empty table.
+- When someone gives advice or a recommendation, lead Key points with it,
+  attributed to them as advice ("X advised …"), with their reasons and
+  conditions. Do not restate it as a neutral fact or as another person's
+  own decision. If a decision follows that advice, say so.
+- Keep tense and status as spoken: an ongoing relationship is not a past one.
 - Keep bullets short.
 """
 
